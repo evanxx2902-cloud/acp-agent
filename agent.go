@@ -113,6 +113,10 @@ func (a *EinoAgent) Initialize(ctx context.Context, params acp.InitializeRequest
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentCapabilities: acp.AgentCapabilities{
 			LoadSession: true,
+			McpCapabilities: acp.McpCapabilities{
+				Http: true,
+				Sse: true,
+			},
 			PromptCapabilities: acp.PromptCapabilities{
 				Image:           true,
 				Audio:           false,

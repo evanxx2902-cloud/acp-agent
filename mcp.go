@@ -29,24 +29,31 @@ func (m *Manager) Connect(ctx context.Context, servers []acp.McpServer) ([]tool.
 	var allTools []tool.BaseTool
 
 	for i, server := range servers {
-		if server.Stdio == nil {
-			continue
-		}
-
-		cli, tools, err := connectStdio(ctx, server.Stdio)
+		cli, tools, err := connectOne(ctx, i, server)
 		if err != nil {
-			slog.Error("failed to connect to MCP server",
-				"index", i, "command", server.Stdio.Command, "error", err,
-			)
+			slog.Error("failed to connect to MCP server", "index", i, "error", err)
 			continue
 		}
-
 		m.clients = append(m.clients, cli)
 		allTools = append(allTools, tools...)
-		slog.Info("connected to MCP server", "command", server.Stdio.Command, "tools", len(tools))
 	}
 
 	return allTools, nil
+}
+
+func connectOne(ctx context.Context, idx int, srv acp.McpServer) (*mcpclient.Client, []tool.BaseTool, error) {
+	switch {
+	case srv.Stdio != nil:
+		return connectStdio(ctx, srv.Stdio)
+	case srv.Http != nil:
+		return connectHTTP(ctx, srv.Http)
+	case srv.Sse != nil:
+		return connectSSE(ctx, srv.Sse)
+	case srv.Acp != nil:
+		return connectACP(ctx, srv.Acp)
+	default:
+		return nil, nil, fmt.Errorf("server %d: no supported transport", idx)
+	}
 }
 
 func connectStdio(ctx context.Context, stdio *acp.McpServerStdio) (*mcpclient.Client, []tool.BaseTool, error) {
@@ -65,10 +72,79 @@ func connectStdio(ctx context.Context, stdio *acp.McpServerStdio) (*mcpclient.Cl
 		return nil, nil, fmt.Errorf("initialize: %w", err)
 	}
 
-	toolsResp, err := cli.ListTools(ctx, mcpgo.ListToolsRequest{})
+	tools, err := discoverTools(ctx, cli)
 	if err != nil {
 		cli.Close()
-		return nil, nil, fmt.Errorf("list tools: %w", err)
+		return nil, nil, err
+	}
+
+	slog.Info("connected to MCP server (stdio)", "command", stdio.Command, "tools", len(tools))
+	return cli, tools, nil
+}
+
+func connectHTTP(ctx context.Context, http *acp.McpServerHttpInline) (*mcpclient.Client, []tool.BaseTool, error) {
+	cli, err := mcpclient.NewStreamableHttpClient(http.Url)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create http client: %w", err)
+	}
+
+	initReq := mcpgo.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcpgo.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcpgo.Implementation{Name: "acp-agent", Version: "0.1.0"}
+	initReq.Params.Capabilities = mcpgo.ClientCapabilities{}
+
+	if _, err := cli.Initialize(ctx, initReq); err != nil {
+		cli.Close()
+		return nil, nil, fmt.Errorf("initialize: %w", err)
+	}
+
+	tools, err := discoverTools(ctx, cli)
+	if err != nil {
+		cli.Close()
+		return nil, nil, err
+	}
+
+	slog.Info("connected to MCP server (http)", "url", http.Url, "tools", len(tools))
+	return cli, tools, nil
+}
+
+func connectSSE(ctx context.Context, sse *acp.McpServerSseInline) (*mcpclient.Client, []tool.BaseTool, error) {
+	cli, err := mcpclient.NewSSEMCPClient(sse.Url)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create sse client: %w", err)
+	}
+
+	initReq := mcpgo.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcpgo.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcpgo.Implementation{Name: "acp-agent", Version: "0.1.0"}
+	initReq.Params.Capabilities = mcpgo.ClientCapabilities{}
+
+	if _, err := cli.Initialize(ctx, initReq); err != nil {
+		cli.Close()
+		return nil, nil, fmt.Errorf("initialize: %w", err)
+	}
+
+	tools, err := discoverTools(ctx, cli)
+	if err != nil {
+		cli.Close()
+		return nil, nil, err
+	}
+
+	slog.Info("connected to MCP server (sse)", "url", sse.Url, "tools", len(tools))
+	return cli, tools, nil
+}
+
+func connectACP(ctx context.Context, acpTransport *acp.McpServerAcpInline) (*mcpclient.Client, []tool.BaseTool, error) {
+	// ACP transport: the MCP server is provided by an ACP component and communicates
+	// over the ACP channel. Implementation requires ACP component support.
+	// See: https://agentclientprotocol.com/protocol/mcp
+	return nil, nil, fmt.Errorf("acp transport not yet implemented (server id: %s)", acpTransport.Id)
+}
+
+func discoverTools(ctx context.Context, cli *mcpclient.Client) ([]tool.BaseTool, error) {
+	toolsResp, err := cli.ListTools(ctx, mcpgo.ListToolsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("list tools: %w", err)
 	}
 
 	var einoTools []tool.BaseTool
@@ -82,7 +158,7 @@ func connectStdio(ctx context.Context, stdio *acp.McpServerStdio) (*mcpclient.Cl
 		einoTools = append(einoTools, adapter)
 	}
 
-	return cli, einoTools, nil
+	return einoTools, nil
 }
 
 func (m *Manager) Close() {
