@@ -180,13 +180,13 @@ type EinoAgent struct {
 	conn      *acp.AgentSideConnection // per-connection, nil if not set
 }
 
-func (a *EinoAgent) buildSessionAgent(tools []tool.BaseTool, systemPrompt string) (*adk.ChatModelAgent, error) {
+func (a *EinoAgent) buildSessionAgent(ctx context.Context, tools []tool.BaseTool, systemPrompt string) (*adk.ChatModelAgent, error) {
 	toolsConfig := adk.ToolsConfig{}
 	toolsConfig.Tools = tools
 
-	return adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:          "eino-agent",
-		Description:   "A general-purpose AI agent with filesystem and shell access",
+		Description:   "A general-purpose AI agent. Tools are provided by the client via MCP servers.",
 		Instruction:   systemPrompt,
 		Model:         a.chatModel,
 		ToolsConfig:   toolsConfig,
@@ -243,7 +243,7 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 		slog.Warn("some MCP servers failed to connect", "error", mcpErr)
 	}
 
-	cmAgent, err := a.buildSessionAgent(mcpTools, systemPrompt)
+	cmAgent, err := a.buildSessionAgent(ctx, mcpTools, systemPrompt)
 	if err != nil {
 		mcpMgr.Close()
 		return acp.NewSessionResponse{}, fmt.Errorf("build agent: %w", err)
@@ -265,12 +265,27 @@ func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionReque
 		return acp.LoadSessionResponse{}, fmt.Errorf("load session: %w", err)
 	}
 
-	// Rebuild a basic agent (no MCP tools — loaded sessions can chat but not use tools)
-	cmAgent, err := a.buildSessionAgent(nil, a.cfg.SystemPrompt)
+	// Reconnect MCP servers if provided via _meta
+	var mcpTools []tool.BaseTool
+	var mcpMgr *Manager
+	if servers, ok := params.Meta["mcpServers"].([]any); ok && len(servers) > 0 {
+		// Convert from JSON generic format
+		data, _ := json.Marshal(servers)
+		var acpServers []acp.McpServer
+		if json.Unmarshal(data, &acpServers) == nil {
+			mcpMgr = &Manager{}
+			mcpTools, _ = mcpMgr.Connect(ctx, acpServers)
+		}
+	}
+
+	cmAgent, err := a.buildSessionAgent(ctx, mcpTools, a.cfg.SystemPrompt)
 	if err != nil {
+		if mcpMgr != nil {
+			mcpMgr.Close()
+		}
 		return acp.LoadSessionResponse{}, fmt.Errorf("build agent: %w", err)
 	}
-	s.SetMCAgent(cmAgent, nil)
+	s.SetMCAgent(cmAgent, mcpMgr)
 
 	return acp.LoadSessionResponse{}, nil
 }
@@ -363,7 +378,7 @@ func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection,
 // createPlan runs the LLM without tools to generate a structured plan.
 func (a *EinoAgent) createPlan(ctx context.Context, conn *acp.AgentSideConnection, s *Session) (acp.PromptResponse, error) {
 	// Build a plan-only agent (no tools)
-	planAgent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+	planAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:        "plan-agent",
 		Description: "Creates step-by-step execution plans",
 		Instruction: a.cfg.SystemPrompt + "\n\n" +
