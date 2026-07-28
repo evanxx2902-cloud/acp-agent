@@ -27,6 +27,9 @@ type Session struct {
 	store    *Store
 	mode     string // "agent" (default) or "plan"
 
+	resumePending bool   // true when the session is waiting for ResumeSession
+	resumeReason  string // "plan_created", "tool_rejected", etc.
+
 	mcpManager *Manager
 	cmAgent    *adk.ChatModelAgent
 	plan       *Plan // pending plan for plan mode
@@ -108,6 +111,20 @@ func (s *Session) SetPlan(p *Plan) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.plan = p
+	s.resumePending = true
+	s.resumeReason = "plan_created"
+}
+
+func (s *Session) CanResume() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resumePending
+}
+
+func (s *Session) ConsumeResume() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resumePending = false
 }
 
 func (s *Session) GetPlan() *Plan {

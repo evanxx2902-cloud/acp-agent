@@ -431,28 +431,30 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 		return acp.ResumeSessionResponse{}, fmt.Errorf("session %s not found", sid)
 	}
 
-	plan := s.GetPlan()
-	if plan == nil {
-		return acp.ResumeSessionResponse{}, fmt.Errorf("no plan pending for session %s", sid)
+	if !s.CanResume() {
+		return acp.ResumeSessionResponse{}, fmt.Errorf("session %s is not waiting for resume", sid)
 	}
-
-	s.SetPlan(nil) // consume plan
 
 	conn := a.getConn()
 	if conn == nil {
 		return acp.ResumeSessionResponse{}, fmt.Errorf("agent connection not set")
 	}
 
-	// Execute plan synchronously, sending streaming updates
 	ctx = ContextWithACP(ctx, conn, acp.SessionId(sid))
 
-	execMsg := schema.UserMessage("Execute the plan step by step. Use the available tools to accomplish each step.\n\nPlan to execute:\n" + planToText(plan))
-	s.AppendMessages(execMsg)
-
-	a.runReAct(ctx, conn, s)
-
-	// Send final plan status
-	sendPlanUpdate(ctx, conn, acp.SessionId(sid), plan)
+	// Different resume actions based on what caused the interrupt
+	plan := s.GetPlan()
+	if plan != nil {
+		s.ConsumeResume()
+		execMsg := schema.UserMessage("Execute the plan step by step. Use the available tools to accomplish each step.\n\nPlan to execute:\n" + planToText(plan))
+		s.AppendMessages(execMsg)
+		a.runReAct(ctx, conn, s)
+		sendPlanUpdate(ctx, conn, acp.SessionId(sid), plan)
+	} else {
+		// Generic resume: just continue the ReAct loop
+		s.ConsumeResume()
+		a.runReAct(ctx, conn, s)
+	}
 
 	return acp.ResumeSessionResponse{}, nil
 }
