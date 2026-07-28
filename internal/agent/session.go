@@ -7,19 +7,25 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-// Session holds per-session state including conversation history.
+// Session holds per-session runtime state.
+// Messages are persisted to SQLite via the Store after every mutation.
 type Session struct {
-	id       string
-	messages []*schema.Message // full conversation history
-	cancel   context.CancelFunc // current turn cancellation
+	ID       string
 	mu       sync.Mutex
+	messages []*schema.Message
+	cancel   context.CancelFunc
+	store    *Store
 }
 
-// AppendMessages safely appends messages to the session history.
+// AppendMessages appends messages and persists to the database.
 func (s *Session) AppendMessages(msgs ...*schema.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.messages = append(s.messages, msgs...)
+	// Write-through: persist immediately
+	if s.store != nil {
+		_ = s.store.SaveMessages(s.ID, s.messages)
+	}
 }
 
 // Messages returns a copy of the session's message history.
@@ -49,35 +55,85 @@ func (s *Session) Cancel() {
 	}
 }
 
-// SessionStore is a thread-safe map of session IDs to Session objects.
-type SessionStore struct {
+// SessionManager manages the in-memory session map backed by a SQLite Store.
+type SessionManager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
+	store    *Store
 }
 
-// NewSessionStore creates a new empty session store.
-func NewSessionStore() *SessionStore {
-	return &SessionStore{sessions: make(map[string]*Session)}
+// NewSessionManager creates a new session manager.
+func NewSessionManager(store *Store) *SessionManager {
+	return &SessionManager{
+		sessions: make(map[string]*Session),
+		store:    store,
+	}
 }
 
-// Get retrieves a session by ID.
-func (ss *SessionStore) Get(id string) (*Session, bool) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	s, ok := ss.sessions[id]
+// Create creates a new session, persists it to the DB, and adds the initial messages.
+func (sm *SessionManager) Create(id string, initialMessages ...*schema.Message) (*Session, error) {
+	if err := sm.store.CreateSession(id); err != nil {
+		return nil, err
+	}
+
+	s := &Session{
+		ID:       id,
+		messages: initialMessages,
+		store:    sm.store,
+	}
+
+	// Persist initial messages
+	if len(initialMessages) > 0 {
+		_ = sm.store.SaveMessages(id, initialMessages)
+	}
+
+	sm.mu.Lock()
+	sm.sessions[id] = s
+	sm.mu.Unlock()
+	return s, nil
+}
+
+// Get retrieves an active session from memory.
+func (sm *SessionManager) Get(id string) (*Session, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	s, ok := sm.sessions[id]
 	return s, ok
 }
 
-// Put stores a session by ID.
-func (ss *SessionStore) Put(id string, s *Session) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	ss.sessions[id] = s
+// Load restores a session from the DB and brings it into memory.
+func (sm *SessionManager) Load(id string) (*Session, error) {
+	msgs, err := sm.store.LoadMessages(id)
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Session{
+		ID:       id,
+		messages: msgs,
+		store:    sm.store,
+	}
+
+	sm.mu.Lock()
+	sm.sessions[id] = s
+	sm.mu.Unlock()
+	return s, nil
 }
 
-// Delete removes a session by ID.
-func (ss *SessionStore) Delete(id string) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	delete(ss.sessions, id)
+// Delete removes a session from memory and DB.
+func (sm *SessionManager) Delete(id string) {
+	sm.mu.Lock()
+	delete(sm.sessions, id)
+	sm.mu.Unlock()
+	_ = sm.store.DeleteSession(id)
+}
+
+// List returns metadata for all persisted sessions.
+func (sm *SessionManager) List() ([]SessionMeta, error) {
+	return sm.store.ListSessions()
+}
+
+// Exists checks if a session exists in the DB.
+func (sm *SessionManager) Exists(id string) (bool, error) {
+	return sm.store.SessionExists(id)
 }

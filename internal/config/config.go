@@ -9,14 +9,18 @@ import (
 // Config holds all configuration for the agent server.
 type Config struct {
 	// LLM backend configuration
-	LLMProvider   string `json:"llm_provider"`   // "openai" or "openai-compatible"
-	LLMAPIKey     string `json:"llm_api_key"`
-	LLMBaseURL    string `json:"llm_base_url"`    // optional custom base URL
-	LLMModel      string `json:"llm_model"`        // e.g. "gpt-4o", "deepseek-chat"
+	LLMProvider string `json:"llm_provider"` // "openai" or "openai-compatible"
+	LLMAPIKey   string `json:"llm_api_key"`
+	LLMBaseURL  string `json:"llm_base_url"` // optional custom base URL
+	LLMModel    string `json:"llm_model"`     // e.g. "gpt-4o", "deepseek-chat"
 
 	// Agent configuration
 	SystemPrompt  string `json:"system_prompt"`
 	MaxIterations int    `json:"max_iterations"` // default 20
+
+	// Session persistence
+	DataDir string `json:"data_dir"` // default ~/.acp-agent
+	DBPath  string `json:"db_path"`  // default $DataDir/sessions.db
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -59,6 +63,25 @@ func Load() Config {
 	}
 	if v := os.Getenv("ACP_SYSTEM_PROMPT"); v != "" {
 		cfg.SystemPrompt = v
+	}
+	if v := os.Getenv("ACP_DATA_DIR"); v != "" {
+		cfg.DataDir = v
+	}
+	if v := os.Getenv("ACP_DB_PATH"); v != "" {
+		cfg.DBPath = v
+	}
+
+	// Defaults for session persistence
+	if cfg.DataDir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			cfg.DataDir = home + "/.acp-agent"
+		} else {
+			cfg.DataDir = ".acp-agent"
+		}
+	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = cfg.DataDir + "/sessions.db"
 	}
 
 	return cfg

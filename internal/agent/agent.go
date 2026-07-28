@@ -22,7 +22,8 @@ import (
 
 // Ensure EinoAgent satisfies the required interfaces.
 var (
-	_ acp.Agent = (*EinoAgent)(nil)
+	_ acp.Agent       = (*EinoAgent)(nil)
+	_ acp.AgentLoader = (*EinoAgent)(nil)
 )
 
 // EinoAgent implements acp.Agent, backed by eino's ChatModelAgent.
@@ -30,17 +31,17 @@ type EinoAgent struct {
 	cfg       config.Config
 	cmAgent   *adk.ChatModelAgent
 	chatModel model.ToolCallingChatModel
-	sessions  *SessionStore
+	sessions  *SessionManager
 	conn      *acp.AgentSideConnection
 	connMu    sync.Mutex
 }
 
-// NewEinoAgent creates a new EinoAgent with the given config and chat model.
-func NewEinoAgent(cfg config.Config, chatModel model.ToolCallingChatModel) *EinoAgent {
+// NewEinoAgent creates a new EinoAgent with the given config, chat model, and session store.
+func NewEinoAgent(cfg config.Config, chatModel model.ToolCallingChatModel, store *Store) *EinoAgent {
 	return &EinoAgent{
 		cfg:       cfg,
 		chatModel: chatModel,
-		sessions:  NewSessionStore(),
+		sessions:  NewSessionManager(store),
 	}
 }
 
@@ -91,6 +92,7 @@ func (a *EinoAgent) Initialize(ctx context.Context, params acp.InitializeRequest
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentCapabilities: acp.AgentCapabilities{
+			LoadSession: true,
 			PromptCapabilities: acp.PromptCapabilities{
 				Image:           true,
 				Audio:           false,
@@ -106,15 +108,29 @@ func (a *EinoAgent) Authenticate(ctx context.Context, params acp.AuthenticateReq
 
 func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	sid := randomID()
-	s := &Session{id: sid}
 
-	// Prepend system message if configured
+	var initMsgs []*schema.Message
 	if a.cfg.SystemPrompt != "" {
-		s.messages = append(s.messages, schema.SystemMessage(a.cfg.SystemPrompt))
+		initMsgs = append(initMsgs, schema.SystemMessage(a.cfg.SystemPrompt))
 	}
 
-	a.sessions.Put(sid, s)
+	_, err := a.sessions.Create(sid, initMsgs...)
+	if err != nil {
+		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
+	}
+
 	return acp.NewSessionResponse{SessionId: acp.SessionId(sid)}, nil
+}
+
+func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	// If the session is not yet in memory, load it from the DB
+	if _, ok := a.sessions.Get(string(params.SessionId)); !ok {
+		_, err := a.sessions.Load(string(params.SessionId))
+		if err != nil {
+			return acp.LoadSessionResponse{}, fmt.Errorf("load session: %w", err)
+		}
+	}
+	return acp.LoadSessionResponse{}, nil
 }
 
 func (a *EinoAgent) Cancel(ctx context.Context, params acp.CancelNotification) error {
@@ -189,7 +205,7 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 		}
 	}
 
-	// Store the assistant's final response in session history
+	// Store the assistant's final response in session history (auto-persists via write-through)
 	responseText := finalContent.String()
 	if responseText != "" {
 		s.AppendMessages(schema.AssistantMessage(responseText, nil))
@@ -206,7 +222,21 @@ func (a *EinoAgent) CloseSession(ctx context.Context, params acp.CloseSessionReq
 }
 
 func (a *EinoAgent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
-	return acp.ListSessionsResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionList)
+	metas, err := a.sessions.List()
+	if err != nil {
+		return acp.ListSessionsResponse{}, fmt.Errorf("list sessions: %w", err)
+	}
+
+	items := make([]acp.SessionInfo, 0, len(metas))
+	for _, m := range metas {
+		updatedAt := m.UpdatedAt.Format(time.RFC3339)
+		items = append(items, acp.SessionInfo{
+			SessionId: acp.SessionId(m.ID),
+			Cwd:       "/",
+			UpdatedAt: &updatedAt,
+		})
+	}
+	return acp.ListSessionsResponse{Sessions: items}, nil
 }
 
 func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
