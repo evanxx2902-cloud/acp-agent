@@ -1,4 +1,4 @@
-package agent
+package main
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
 
-	"acp/internal/mcp"
 )
 
 // Session holds per-session runtime state.
@@ -20,7 +19,7 @@ type Session struct {
 	store    *Store
 
 	// MCP integration
-	mcpManager *mcp.Manager
+	mcpManager *Manager
 
 	// Per-session ChatModelAgent (may include MCP-discovered tools)
 	cmAgent *adk.ChatModelAgent
@@ -64,7 +63,7 @@ func (s *Session) Cancel() {
 }
 
 // SetMCAgent stores the per-session ChatModelAgent and MCP manager.
-func (s *Session) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *mcp.Manager) {
+func (s *Session) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *Manager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cmAgent = cmAgent

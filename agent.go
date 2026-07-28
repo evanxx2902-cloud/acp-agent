@@ -1,4 +1,4 @@
-package agent
+package main
 
 import (
 	"context"
@@ -17,9 +17,6 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
-	"acp/internal/bridge"
-	"acp/internal/config"
-	"acp/internal/mcp"
 )
 
 // Ensure EinoAgent satisfies the required interfaces.
@@ -30,7 +27,7 @@ var (
 
 // EinoAgent implements acp.Agent, backed by eino's ChatModelAgent.
 type EinoAgent struct {
-	cfg       config.Config
+	cfg       Config
 	chatModel model.ToolCallingChatModel
 	sessions  *SessionManager
 	conn      *acp.AgentSideConnection
@@ -38,7 +35,7 @@ type EinoAgent struct {
 }
 
 // NewEinoAgent creates a new EinoAgent with the given config, chat model, and session store.
-func NewEinoAgent(cfg config.Config, chatModel model.ToolCallingChatModel, store *Store) *EinoAgent {
+func NewEinoAgent(cfg Config, chatModel model.ToolCallingChatModel, store *Store) *EinoAgent {
 	return &EinoAgent{
 		cfg:       cfg,
 		chatModel: chatModel,
@@ -111,11 +108,11 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 	}
 
 	// Connect MCP servers and discover tools
-	mcpMgr := &mcp.Manager{}
+	mcpMgr := &Manager{}
 	mcpTools, _ := mcpMgr.Connect(ctx, params.McpServers)
 
 	// Build session-specific agent: base tools + MCP tools
-	allTools := bridge.BuildTools()
+	allTools := BuildTools()
 	allTools = append(allTools, mcpTools...)
 	cmAgent, err := a.buildSessionAgent(allTools)
 	if err != nil {
@@ -168,10 +165,10 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 	}
 
 	// Inject ACP connection context so tools can access the connection
-	ctx = bridge.ContextWithACP(ctx, conn, acp.SessionId(sid))
+	ctx = ContextWithACP(ctx, conn, acp.SessionId(sid))
 
 	// Convert ACP content blocks to eino message and append to history
-	userMsg := bridge.ContentBlocksToMessage(params.Prompt)
+	userMsg := ContentBlocksToMessage(params.Prompt)
 	s.AppendMessages(userMsg)
 
 	// Build the full message list for this turn
@@ -208,7 +205,7 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 		}
 
 		if event.Output != nil && event.Output.MessageOutput != nil {
-			err := bridge.ProcessAgentEvent(ctx, conn, sid, event, &finalContent)
+			err := ProcessAgentEvent(ctx, conn, sid, event, &finalContent)
 			if err != nil {
 				slog.Error("failed to process agent event", "error", err)
 			}

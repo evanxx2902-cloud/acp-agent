@@ -1,4 +1,4 @@
-package config
+package main
 
 import (
 	"encoding/json"
@@ -34,7 +34,7 @@ func DefaultConfig() Config {
 }
 
 // Load reads configuration from environment variables and an optional config file.
-func Load() Config {
+func LoadConfig() Config {
 	cfg := DefaultConfig()
 
 	// Optional config file

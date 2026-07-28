@@ -37,7 +37,7 @@
 ### 编译
 
 ```bash
-go build -o agent-server ./cmd/agent-server/
+go build -o agent-server .
 ```
 
 ### 运行
@@ -126,17 +126,17 @@ export ACP_LLM_API_KEY="ollama"  # Ollama 不需要真实的 API Key
 
 ```
 acp/
-├── cmd/agent-server/main.go        # 入口：配置加载、依赖注入、启动服务
-├── internal/
-│   ├── config/config.go            # 配置结构体及加载逻辑（环境变量 + JSON 文件）
-│   ├── llm/factory.go              # LLM ChatModel 工厂
-│   ├── agent/
-│   │   ├── agent.go                # EinoAgent：实现 acp.Agent 接口
-│   │   └── session.go              # 会话存储及状态管理
-│   └── bridge/
-│       ├── messages.go             # ACP ContentBlock ↔ eino Message 转换
-│       ├── streaming.go            # eino AgentEvent → ACP SessionUpdate 流式桥接
-│       └── tools.go                # ACPBackedTool：将 ACP 操作封装为 eino 工具
+├── main.go              # 入口：配置加载、依赖注入、启动服务
+├── agent.go             # EinoAgent：实现 acp.Agent 接口
+├── session.go           # Session + SessionManager（SQLite 持久化）
+├── store.go             # SQLite 持久化层
+├── config.go            # 配置结构体及加载逻辑（环境变量 + JSON 文件）
+├── llm.go               # LLM ChatModel 工厂
+├── messages.go          # ACP ContentBlock ↔ eino Message 转换
+├── streaming.go         # eino AgentEvent → ACP SessionUpdate 流式桥接
+├── tools.go             # baseTools：read_file / write_file / run_command
+├── mcp_adapter.go       # MCP 工具 → eino BaseTool 适配器
+├── mcp_manager.go       # MCP 客户端生命周期管理
 ├── go.mod
 └── go.sum
 ```
@@ -162,7 +162,7 @@ acp-go-sdk 自带一个 ACP 客户端示例，可以直接用来验证 agent 是
 ```bash
 # 编译 agent
 cd /home/evan/acp
-go build -o agent-server ./cmd/agent-server/
+go build -o agent-server .
 
 # 创建配置文件（包含 API Key，不要提交到 git）
 cat > config.json << 'EOF'

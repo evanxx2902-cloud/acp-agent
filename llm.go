@@ -1,4 +1,4 @@
-package llm
+package main
 
 import (
 	"context"
@@ -6,11 +6,10 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino-ext/components/model/openai"
 
-	"acp/internal/config"
 )
 
 // NewChatModel creates a ToolCallingChatModel based on the configuration.
-func NewChatModel(ctx context.Context, cfg config.Config) (model.ToolCallingChatModel, error) {
+func NewChatModel(ctx context.Context, cfg Config) (model.ToolCallingChatModel, error) {
 	baseURL := cfg.LLMBaseURL
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
