@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -46,31 +45,32 @@ func main() {
 		os.Exit(1)
 	}
 
-	ag := NewEinoAgent(cfg, chatModel, store)
+	sessionMgr := NewSessionManager(store)
 
 	switch {
 	case strings.HasPrefix(cfg.Listen, "tcp:"):
 		addr := strings.TrimPrefix(cfg.Listen, "tcp:")
-		serveTCP(ctx, addr, ag, logger)
+		serveTCP(ctx, addr, cfg, chatModel, sessionMgr, logger)
 	case strings.HasPrefix(cfg.Listen, "unix:"):
 		path := strings.TrimPrefix(cfg.Listen, "unix:")
-		serveUnix(ctx, path, ag, logger)
+		serveUnix(ctx, path, cfg, chatModel, sessionMgr, logger)
 	default:
-		serveStdio(ag, logger)
+		serveStdio(cfg, chatModel, sessionMgr, logger)
 	}
 }
 
-func serveStdio(ag *EinoAgent, logger *slog.Logger) {
+func serveStdio(cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, logger *slog.Logger) {
+	ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
 	conn := acp.NewAgentSideConnection(ag, os.Stdout, os.Stdin)
 	conn.SetLogger(logger)
-	ag.SetAgentConnection(conn)
+	ag.conn = conn
 
 	slog.Info("agent server started (stdio)", "version", acp.ProtocolVersionNumber)
 	<-conn.Done()
 	slog.Info("agent server shutting down")
 }
 
-func serveTCP(ctx context.Context, addr string, ag *EinoAgent, logger *slog.Logger) {
+func serveTCP(ctx context.Context, addr string, cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, logger *slog.Logger) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		slog.Error("failed to listen", "addr", addr, "error", err)
@@ -94,14 +94,16 @@ func serveTCP(ctx context.Context, addr string, ag *EinoAgent, logger *slog.Logg
 
 		slog.Info("client connected", "remote", raw.RemoteAddr())
 		go func(c net.Conn) {
+			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
 			conn := acp.NewAgentSideConnection(ag, c, c)
 			conn.SetLogger(logger)
+			ag.conn = conn
 			<-conn.Done()
 		}(raw)
 	}
 }
 
-func serveUnix(ctx context.Context, path string, ag *EinoAgent, logger *slog.Logger) {
+func serveUnix(ctx context.Context, path string, cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, logger *slog.Logger) {
 	_ = os.Remove(path)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -133,8 +135,10 @@ func serveUnix(ctx context.Context, path string, ag *EinoAgent, logger *slog.Log
 
 		slog.Info("client connected", "path", path)
 		go func(c net.Conn) {
+			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
 			conn := acp.NewAgentSideConnection(ag, c, c)
 			conn.SetLogger(logger)
+			ag.conn = conn
 			<-conn.Done()
 		}(raw)
 	}
@@ -153,28 +157,7 @@ type EinoAgent struct {
 	cfg       Config
 	chatModel model.ToolCallingChatModel
 	sessions  *SessionManager
-	conn      *acp.AgentSideConnection
-	connMu    sync.Mutex
-}
-
-func NewEinoAgent(cfg Config, chatModel model.ToolCallingChatModel, store *Store) *EinoAgent {
-	return &EinoAgent{
-		cfg:       cfg,
-		chatModel: chatModel,
-		sessions:  NewSessionManager(store),
-	}
-}
-
-func (a *EinoAgent) SetAgentConnection(conn *acp.AgentSideConnection) {
-	a.connMu.Lock()
-	a.conn = conn
-	a.connMu.Unlock()
-}
-
-func (a *EinoAgent) getConn() *acp.AgentSideConnection {
-	a.connMu.Lock()
-	defer a.connMu.Unlock()
-	return a.conn
+	conn      *acp.AgentSideConnection // per-connection, nil if not set
 }
 
 func (a *EinoAgent) buildSessionAgent(tools []tool.BaseTool, systemPrompt string) (*adk.ChatModelAgent, error) {
@@ -235,7 +218,10 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 	}
 
 	mcpMgr := &Manager{}
-	mcpTools, _ := mcpMgr.Connect(ctx, params.McpServers)
+	mcpTools, mcpErr := mcpMgr.Connect(ctx, params.McpServers)
+	if mcpErr != nil {
+		slog.Warn("some MCP servers failed to connect", "error", mcpErr)
+	}
 
 	cmAgent, err := a.buildSessionAgent(mcpTools, systemPrompt)
 	if err != nil {
@@ -249,12 +235,23 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 }
 
 func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	if _, ok := a.sessions.Get(string(params.SessionId)); !ok {
-		_, err := a.sessions.Load(string(params.SessionId))
-		if err != nil {
-			return acp.LoadSessionResponse{}, fmt.Errorf("load session: %w", err)
-		}
+	sid := string(params.SessionId)
+	if _, ok := a.sessions.Get(sid); ok {
+		return acp.LoadSessionResponse{}, nil
 	}
+
+	s, err := a.sessions.Load(sid)
+	if err != nil {
+		return acp.LoadSessionResponse{}, fmt.Errorf("load session: %w", err)
+	}
+
+	// Rebuild a basic agent (no MCP tools — loaded sessions can chat but not use tools)
+	cmAgent, err := a.buildSessionAgent(nil, a.cfg.SystemPrompt)
+	if err != nil {
+		return acp.LoadSessionResponse{}, fmt.Errorf("build agent: %w", err)
+	}
+	s.SetMCAgent(cmAgent, nil)
+
 	return acp.LoadSessionResponse{}, nil
 }
 
@@ -279,7 +276,7 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 	s.SetCancel(cancel)
 	defer cancel()
 
-	conn := a.getConn()
+	conn := a.conn
 	if conn == nil {
 		return acp.PromptResponse{}, fmt.Errorf("agent connection not set")
 	}
@@ -530,7 +527,7 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 		return acp.ResumeSessionResponse{}, fmt.Errorf("session %s is not waiting for resume", sid)
 	}
 
-	conn := a.getConn()
+	conn := a.conn
 	if conn == nil {
 		return acp.ResumeSessionResponse{}, fmt.Errorf("agent connection not set")
 	}
