@@ -20,6 +20,7 @@ type Config struct {
 	MaxIterations int    `json:"max_iterations"`
 	DataDir       string `json:"data_dir"`
 	DBPath        string `json:"db_path"`
+	Listen        string `json:"listen"` // "stdio" (default), "tcp:PORT", "unix:PATH"
 }
 
 func DefaultConfig() Config {
@@ -27,6 +28,7 @@ func DefaultConfig() Config {
 		LLMProvider:   "openai-compatible",
 		LLMModel:      "gpt-4o",
 		MaxIterations: 20,
+		Listen:        "stdio",
 		SystemPrompt:  "You are a helpful AI assistant. You can read and write files on the user's system using the available tools.",
 	}
 }
@@ -61,6 +63,9 @@ func LoadConfig() Config {
 	}
 	if v := os.Getenv("ACP_DATA_DIR"); v != "" {
 		cfg.DataDir = v
+	}
+	if v := os.Getenv("ACP_LISTEN"); v != "" {
+		cfg.Listen = v
 	}
 	if v := os.Getenv("ACP_DB_PATH"); v != "" {
 		cfg.DBPath = v

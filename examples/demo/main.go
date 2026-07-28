@@ -22,41 +22,58 @@ func main() {
 
 	autoYes := flag.Bool("y", false, "Auto-approve all tool permissions")
 	mode := flag.String("mode", "agent", "Session mode: 'agent' or 'plan'")
+	connect := flag.String("connect", "", "Connect to running agent: tcp://host:port or unix:///path/to/sock")
 	flag.Parse()
-	runClient(*autoYes, *mode)
+	runClient(*autoYes, *mode, *connect)
 }
 
 // =========================================================================
 // ACP Client
 // =========================================================================
 
-func runClient(autoYes bool, mode string) {
+func runClient(autoYes bool, mode string, connectAddr string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer cancel()
 
 	selfPath := selfExe()
-	agentPath := findAgentBinary()
 
 	fmt.Print("=== ACP Agent Demo ===\n\n")
-	fmt.Printf("Agent:    %s\n", agentPath)
-	fmt.Printf("MCP:      %s --mcp-server\n", selfPath)
 	if autoYes {
 		fmt.Println("Auto-yes: enabled")
 	}
 	fmt.Printf("Mode:     %s\n\n", mode)
 
-	agentCmd := exec.CommandContext(ctx, agentPath, "-config", "config.json")
-	agentCmd.Stderr = os.Stderr
-	agentIn, _ := agentCmd.StdinPipe()
-	agentOut, _ := agentCmd.StdoutPipe()
-	if err := agentCmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
-		os.Exit(1)
-	}
-	defer agentCmd.Process.Kill()
-
 	client := &demoClient{autoYes: autoYes}
-	conn := acp.NewClientSideConnection(client, agentIn, agentOut)
+
+	var conn *acp.ClientSideConnection
+	if connectAddr != "" {
+		// Connect to running agent via TCP or Unix socket
+		c, err := dialAgent(connectAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to connect: %v\n", err)
+			os.Exit(1)
+		}
+		defer c.Close()
+		fmt.Printf("Connected to agent at %s\n\n", connectAddr)
+		conn = acp.NewClientSideConnection(client, c, c)
+	} else {
+		// Spawn agent as child process (stdio)
+		agentPath := findAgentBinary()
+		fmt.Printf("Agent:    %s\n", agentPath)
+		fmt.Printf("MCP:      %s --mcp-server\n", selfPath)
+
+		agentCmd := exec.CommandContext(ctx, agentPath, "-config", "config.json")
+		agentCmd.Stderr = os.Stderr
+		agentIn, _ := agentCmd.StdinPipe()
+		agentOut, _ := agentCmd.StdoutPipe()
+		if err := agentCmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
+			os.Exit(1)
+		}
+		defer agentCmd.Process.Kill()
+		fmt.Println()
+		conn = acp.NewClientSideConnection(client, agentIn, agentOut)
+	}
 
 	initResp, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,

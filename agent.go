@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -45,14 +47,97 @@ func main() {
 	}
 
 	ag := NewEinoAgent(cfg, chatModel, store)
+
+	switch {
+	case strings.HasPrefix(cfg.Listen, "tcp:"):
+		addr := strings.TrimPrefix(cfg.Listen, "tcp:")
+		serveTCP(ctx, addr, ag, logger)
+	case strings.HasPrefix(cfg.Listen, "unix:"):
+		path := strings.TrimPrefix(cfg.Listen, "unix:")
+		serveUnix(ctx, path, ag, logger)
+	default:
+		serveStdio(ag, logger)
+	}
+}
+
+func serveStdio(ag *EinoAgent, logger *slog.Logger) {
 	conn := acp.NewAgentSideConnection(ag, os.Stdout, os.Stdin)
 	conn.SetLogger(logger)
 	ag.SetAgentConnection(conn)
 
-	slog.Info("agent server started", "version", acp.ProtocolVersionNumber)
-
+	slog.Info("agent server started (stdio)", "version", acp.ProtocolVersionNumber)
 	<-conn.Done()
 	slog.Info("agent server shutting down")
+}
+
+func serveTCP(ctx context.Context, addr string, ag *EinoAgent, logger *slog.Logger) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Error("failed to listen", "addr", addr, "error", err)
+		os.Exit(1)
+	}
+	defer ln.Close()
+
+	slog.Info("agent server listening (tcp)", "addr", addr, "version", acp.ProtocolVersionNumber)
+
+	for {
+		raw, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				slog.Error("accept error", "error", err)
+				continue
+			}
+		}
+
+		slog.Info("client connected", "remote", raw.RemoteAddr())
+		go func(c net.Conn) {
+			conn := acp.NewAgentSideConnection(ag, c, c)
+			conn.SetLogger(logger)
+			<-conn.Done()
+		}(raw)
+	}
+}
+
+func serveUnix(ctx context.Context, path string, ag *EinoAgent, logger *slog.Logger) {
+	_ = os.Remove(path)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		slog.Error("failed to create socket dir", "dir", dir, "error", err)
+		os.Exit(1)
+	}
+
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		slog.Error("failed to listen", "path", path, "error", err)
+		os.Exit(1)
+	}
+	defer ln.Close()
+	defer os.Remove(path)
+
+	slog.Info("agent server listening (unix)", "path", path, "version", acp.ProtocolVersionNumber)
+
+	for {
+		raw, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				slog.Error("accept error", "error", err)
+				continue
+			}
+		}
+
+		slog.Info("client connected", "path", path)
+		go func(c net.Conn) {
+			conn := acp.NewAgentSideConnection(ag, c, c)
+			conn.SetLogger(logger)
+			<-conn.Done()
+		}(raw)
+	}
 }
 
 // =========================================================================

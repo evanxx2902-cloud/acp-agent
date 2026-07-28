@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -53,6 +55,17 @@ func selfExe() string {
 func mustCwd() string {
 	wd, _ := os.Getwd()
 	return wd
+}
+
+func dialAgent(addr string) (net.Conn, error) {
+	switch {
+	case strings.HasPrefix(addr, "tcp://"):
+		return net.Dial("tcp", strings.TrimPrefix(addr, "tcp://"))
+	case strings.HasPrefix(addr, "unix://"):
+		return net.Dial("unix", strings.TrimPrefix(addr, "unix://"))
+	default:
+		return nil, fmt.Errorf("unsupported address scheme: %s (use tcp://host:port or unix:///path/to/sock)", addr)
+	}
 }
 
 func die(method string, err error) {
