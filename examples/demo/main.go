@@ -21,15 +21,16 @@ func main() {
 	}
 
 	autoYes := flag.Bool("y", false, "Auto-approve all tool permissions")
+	mode := flag.String("mode", "agent", "Session mode: 'agent' or 'plan'")
 	flag.Parse()
-	runClient(*autoYes)
+	runClient(*autoYes, *mode)
 }
 
 // =========================================================================
 // ACP Client
 // =========================================================================
 
-func runClient(autoYes bool) {
+func runClient(autoYes bool, mode string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer cancel()
 
@@ -42,7 +43,7 @@ func runClient(autoYes bool) {
 	if autoYes {
 		fmt.Println("Auto-yes: enabled")
 	}
-	fmt.Println()
+	fmt.Printf("Mode:     %s\n\n", mode)
 
 	agentCmd := exec.CommandContext(ctx, agentPath, "-config", "config.json")
 	agentCmd.Stderr = os.Stderr
@@ -80,9 +81,20 @@ func runClient(autoYes bool) {
 	}
 	fmt.Printf("Session: %s\n\n", newSess.SessionId)
 
+	if mode != "agent" {
+		conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
+			SessionId: newSess.SessionId,
+			ModeId:    acp.SessionModeId(mode),
+		})
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("> ")
+		if mode == "plan" {
+			fmt.Print("[plan] > ")
+		} else {
+			fmt.Print("> ")
+		}
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
@@ -93,6 +105,17 @@ func runClient(autoYes bool) {
 		}
 
 		fmt.Println()
+		if mode == "plan" && (line == "g" || line == "go") {
+			_, err = conn.ResumeSession(ctx, acp.ResumeSessionRequest{
+				SessionId: newSess.SessionId,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "resume error: %v\n", err)
+			}
+			fmt.Println()
+			continue
+		}
+
 		_, err = conn.Prompt(ctx, acp.PromptRequest{
 			SessionId: newSess.SessionId,
 			Prompt:    []acp.ContentBlock{acp.TextBlock(line)},
@@ -130,6 +153,18 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 			kind = fmt.Sprintf(" [%s]", string(u.ToolCall.Kind))
 		}
 		fmt.Printf("\n🔧 %s%s\n", u.ToolCall.Title, kind)
+	case u.Plan != nil:
+		fmt.Println("\n📋 Plan:")
+		for _, entry := range u.Plan.Entries {
+			icon := "○"
+			switch entry.Status {
+			case "in_progress":
+				icon = "◉"
+			case "completed":
+				icon = "●"
+			}
+			fmt.Printf("  %s %s\n", icon, entry.Content)
+		}
 	case u.ToolCallUpdate != nil:
 		status := "?"
 		if u.ToolCallUpdate.Status != nil {

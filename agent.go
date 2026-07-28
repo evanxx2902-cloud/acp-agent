@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -193,11 +194,23 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 	userMsg := ContentBlocksToMessage(params.Prompt)
 	s.AppendMessages(userMsg)
 
+	// Plan mode: create plan first, then wait for ResumeSession to execute
+	if s.GetMode() == "plan" && s.GetPlan() == nil {
+		return a.createPlan(ctx, conn, s)
+	}
+
+	a.runReAct(ctx, conn, s)
+
+	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+}
+
+// runReAct runs the eino ReAct loop, streaming output to the ACP client.
+func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection, s *Session) {
 	messages := s.Messages()
 
 	cmAgent := s.GetAgent()
 	if cmAgent == nil {
-		return acp.PromptResponse{}, fmt.Errorf("agent not initialized for session %s", sid)
+		return
 	}
 
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
@@ -213,17 +226,12 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 		if !ok {
 			break
 		}
-
 		if event.Err != nil {
-			if ctx.Err() != nil {
-				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
-			}
 			slog.Error("agent error", "error", event.Err)
-			return acp.PromptResponse{}, event.Err
+			break
 		}
-
 		if event.Output != nil && event.Output.MessageOutput != nil {
-			if err := ProcessAgentEvent(ctx, conn, sid, event, &finalContent); err != nil {
+			if err := ProcessAgentEvent(ctx, conn, s.ID, event, &finalContent); err != nil {
 				slog.Error("failed to process agent event", "error", err)
 			}
 		}
@@ -233,11 +241,146 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 	if responseText != "" {
 		s.AppendMessages(schema.AssistantMessage(responseText, nil))
 	}
-
-	return acp.PromptResponse{
-		StopReason: acp.StopReasonEndTurn,
-	}, nil
 }
+
+// createPlan runs the LLM without tools to generate a structured plan.
+func (a *EinoAgent) createPlan(ctx context.Context, conn *acp.AgentSideConnection, s *Session) (acp.PromptResponse, error) {
+	// Build a plan-only agent (no tools)
+	planAgent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+		Name:        "plan-agent",
+		Description: "Creates step-by-step execution plans",
+		Instruction: a.cfg.SystemPrompt + "\n\n" +
+			"You are in PLANNING mode. Do NOT execute any tools or commands. " +
+			"Instead, analyze the user's request and create a detailed, step-by-step plan. " +
+			"Output your plan in JSON format as an array of steps. " +
+			"Each step must have: \"description\" (what to do) and \"tool\" (which tool to use). " +
+			"Example: [{\"description\":\"Read the project README\",\"tool\":\"read_file\"}]. " +
+			"Output ONLY the JSON array, no other text.",
+		Model:         a.chatModel,
+		ToolsConfig:   adk.ToolsConfig{}, // empty — no tools
+		MaxIterations: 1,
+	})
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	messages := s.Messages()
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{
+		Agent:           planAgent,
+		EnableStreaming: false,
+	})
+
+	iter := runner.Run(ctx, messages)
+
+	var planText strings.Builder
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event.Err != nil {
+			slog.Error("plan creation error", "error", event.Err)
+			break
+		}
+		if event.Output != nil && event.Output.MessageOutput != nil {
+			msg := event.Output.MessageOutput.Message
+			if msg != nil && msg.Content != "" {
+				planText.WriteString(msg.Content)
+			}
+		}
+	}
+
+	plan := parsePlanFromText(planText.String())
+	if len(plan.Entries) == 0 {
+		// Fallback: single-step plan
+		plan.Entries = []PlanEntry{{Description: planText.String(), Status: "pending"}}
+	}
+
+	s.SetPlan(plan)
+	sendPlanUpdate(ctx, conn, acp.SessionId(s.ID), plan)
+
+	// Tell user the plan was created
+	_ = conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: acp.SessionId(s.ID),
+		Update:    acp.UpdateAgentMessageText("Plan created with " + itoa(len(plan.Entries)) + " steps. Review and confirm to execute."),
+	})
+
+	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+}
+
+// =========================================================================
+// Plan helpers
+// =========================================================================
+
+func parsePlanFromText(text string) *Plan {
+	text = strings.TrimSpace(text)
+
+	// Try JSON array first
+	text = extractJSON(text)
+	var entries []PlanEntry
+	if err := json.Unmarshal([]byte(text), &entries); err == nil && len(entries) > 0 {
+		for i := range entries {
+			entries[i].Status = "pending"
+		}
+		return &Plan{Entries: entries}
+	}
+
+	// Fallback: parse numbered list
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if len(line) < 3 {
+			continue
+		}
+		// Strip leading "1. " or "- " or "1) "
+		for len(line) > 0 && (line[0] >= '0' && line[0] <= '9' || line[0] == '.' || line[0] == '-' || line[0] == ')' || line[0] == ' ') {
+			line = line[1:]
+		}
+		line = strings.TrimSpace(line)
+		if line != "" {
+			entries = append(entries, PlanEntry{Description: line, Status: "pending"})
+		}
+	}
+
+	if len(entries) > 0 {
+		return &Plan{Entries: entries}
+	}
+	return &Plan{}
+}
+
+func extractJSON(s string) string {
+	start := strings.Index(s, "[")
+	end := strings.LastIndex(s, "]")
+	if start >= 0 && end > start {
+		return s[start : end+1]
+	}
+	return s
+}
+
+func sendPlanUpdate(ctx context.Context, conn *acp.AgentSideConnection, sid acp.SessionId, plan *Plan) {
+	entries := make([]acp.PlanEntry, len(plan.Entries))
+	for i, e := range plan.Entries {
+		entries[i] = acp.PlanEntry{
+			Content:  e.Description,
+			Status:   acp.PlanEntryStatus(e.Status),
+			Priority: acp.PlanEntryPriorityMedium,
+		}
+	}
+	_ = conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: sid,
+		Update:    acp.UpdatePlan(entries...),
+	})
+}
+
+func planToText(plan *Plan) string {
+	var b strings.Builder
+	for i, e := range plan.Entries {
+		fmt.Fprintf(&b, "%d. %s [%s]\n", i+1, e.Description, e.Status)
+	}
+	return b.String()
+}
+
+func itoa(n int) string { return fmt.Sprintf("%d", n) }
 
 func (a *EinoAgent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	sid := string(params.SessionId)
@@ -266,16 +409,52 @@ func (a *EinoAgent) ListSessions(ctx context.Context, params acp.ListSessionsReq
 	return acp.ListSessionsResponse{Sessions: items}, nil
 }
 
-func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	return acp.ResumeSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionResume)
-}
-
 func (a *EinoAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
 	return acp.SetSessionConfigOptionResponse{}, nil
 }
 
 func (a *EinoAgent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	sid := string(params.SessionId)
+	s, ok := a.sessions.Get(sid)
+	if !ok {
+		return acp.SetSessionModeResponse{}, fmt.Errorf("session %s not found", sid)
+	}
+	s.SetMode(string(params.ModeId))
+	slog.Info("session mode set", "session", sid, "mode", params.ModeId)
 	return acp.SetSessionModeResponse{}, nil
+}
+
+func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+	sid := string(params.SessionId)
+	s, ok := a.sessions.Get(sid)
+	if !ok {
+		return acp.ResumeSessionResponse{}, fmt.Errorf("session %s not found", sid)
+	}
+
+	plan := s.GetPlan()
+	if plan == nil {
+		return acp.ResumeSessionResponse{}, fmt.Errorf("no plan pending for session %s", sid)
+	}
+
+	s.SetPlan(nil) // consume plan
+
+	conn := a.getConn()
+	if conn == nil {
+		return acp.ResumeSessionResponse{}, fmt.Errorf("agent connection not set")
+	}
+
+	// Execute plan synchronously, sending streaming updates
+	ctx = ContextWithACP(ctx, conn, acp.SessionId(sid))
+
+	execMsg := schema.UserMessage("Execute the plan step by step. Use the available tools to accomplish each step.\n\nPlan to execute:\n" + planToText(plan))
+	s.AppendMessages(execMsg)
+
+	a.runReAct(ctx, conn, s)
+
+	// Send final plan status
+	sendPlanUpdate(ctx, conn, acp.SessionId(sid), plan)
+
+	return acp.ResumeSessionResponse{}, nil
 }
 
 func (a *EinoAgent) Logout(ctx context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {

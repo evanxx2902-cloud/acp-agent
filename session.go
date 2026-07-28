@@ -25,9 +25,22 @@ type Session struct {
 	messages []*schema.Message
 	cancel   context.CancelFunc
 	store    *Store
+	mode     string // "agent" (default) or "plan"
 
 	mcpManager *Manager
 	cmAgent    *adk.ChatModelAgent
+	plan       *Plan // pending plan for plan mode
+}
+
+// Plan holds a plan created by the LLM in plan mode.
+type Plan struct {
+	Entries []PlanEntry `json:"entries"`
+}
+
+// PlanEntry is a single step in the plan.
+type PlanEntry struct {
+	Description string `json:"description"`
+	Status      string `json:"status"` // "pending", "in_progress", "completed"
 }
 
 func (s *Session) AppendMessages(msgs ...*schema.Message) {
@@ -74,6 +87,47 @@ func (s *Session) GetAgent() *adk.ChatModelAgent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cmAgent
+}
+
+func (s *Session) SetMode(mode string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mode = mode
+}
+
+func (s *Session) GetMode() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mode == "" {
+		return "agent"
+	}
+	return s.mode
+}
+
+func (s *Session) SetPlan(p *Plan) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.plan = p
+}
+
+func (s *Session) GetPlan() *Plan {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.plan == nil {
+		return nil
+	}
+	cp := *s.plan
+	cp.Entries = make([]PlanEntry, len(s.plan.Entries))
+	copy(cp.Entries, s.plan.Entries)
+	return &cp
+}
+
+func (s *Session) UpdatePlanStatus(idx int, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.plan != nil && idx >= 0 && idx < len(s.plan.Entries) {
+		s.plan.Entries[idx].Status = status
+	}
 }
 
 func (s *Session) CloseMCP() {
