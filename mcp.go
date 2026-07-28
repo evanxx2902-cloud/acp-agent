@@ -27,6 +27,7 @@ type Manager struct {
 
 func (m *Manager) Connect(ctx context.Context, servers []acp.McpServer) ([]tool.BaseTool, error) {
 	var allTools []tool.BaseTool
+	seen := make(map[string]int) // tool name → server index for collision detection
 
 	for i, server := range servers {
 		cli, tools, err := connectOne(ctx, i, server)
@@ -35,7 +36,20 @@ func (m *Manager) Connect(ctx context.Context, servers []acp.McpServer) ([]tool.
 			continue
 		}
 		m.clients = append(m.clients, cli)
-		allTools = append(allTools, tools...)
+
+		for _, t := range tools {
+			info, _ := t.Info(context.Background())
+			if info == nil {
+				continue
+			}
+			if prevIdx, ok := seen[info.Name]; ok {
+				slog.Warn("MCP tool name collision, using from first server",
+					"name", info.Name, "firstServer", prevIdx, "skippedServer", i)
+				continue
+			}
+			seen[info.Name] = i
+			allTools = append(allTools, t)
+		}
 	}
 
 	return allTools, nil

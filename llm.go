@@ -20,7 +20,8 @@ type Config struct {
 	MaxIterations int    `json:"max_iterations"`
 	DataDir       string `json:"data_dir"`
 	DBPath        string `json:"db_path"`
-	Listen        string `json:"listen"` // "stdio" (default), "tcp:PORT", "unix:PATH"
+	Listen        string `json:"listen"`     // "stdio" (default), "tcp:PORT", "unix:PATH"
+	LogLevel      string `json:"log_level"`  // "debug", "info", "warn", "error"
 }
 
 func DefaultConfig() Config {
@@ -29,6 +30,7 @@ func DefaultConfig() Config {
 		LLMModel:      "gpt-4o",
 		MaxIterations: 20,
 		Listen:        "stdio",
+	LogLevel:      "info",
 		SystemPrompt:  "You are a helpful AI assistant. You can read and write files on the user's system using the available tools.",
 	}
 }
@@ -66,6 +68,9 @@ func LoadConfig() Config {
 	}
 	if v := os.Getenv("ACP_LISTEN"); v != "" {
 		cfg.Listen = v
+	}
+	if v := os.Getenv("ACP_LOG_LEVEL"); v != "" {
+		cfg.LogLevel = v
 	}
 	if v := os.Getenv("ACP_DB_PATH"); v != "" {
 		cfg.DBPath = v
