@@ -1,0 +1,12 @@
+# Built binary
+/agent-server
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
