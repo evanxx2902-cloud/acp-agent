@@ -20,7 +20,7 @@ type Config struct {
 	MaxIterations int    `json:"max_iterations"`
 	DataDir       string `json:"data_dir"`
 	DBPath        string `json:"db_path"`
-	Listen        string `json:"listen"`     // "stdio" (default), "tcp:PORT", "unix:PATH"
+	Listen        string `json:"listen"`     // "stdio" (default), "tcp://host:port", "unix:///path/to/sock"
 	LogLevel      string `json:"log_level"`  // "debug", "info", "warn", "error"
 }
 

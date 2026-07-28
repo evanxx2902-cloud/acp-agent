@@ -13,33 +13,33 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-var dbPool *sql.DB
+var pgPool *sql.DB
 
-func registerDBTools(s *server.MCPServer) {
-	dbPool = connectDB()
+func registerPGTools(s *server.MCPServer) {
+	pgPool = connectPG()
 
-	s.AddTool(mcp.NewTool("query_database",
+	s.AddTool(mcp.NewTool("pg_query",
 		mcp.WithDescription("Execute a SQL query against the PostgreSQL database and return results."),
 		mcp.WithString("sql", mcp.Description("SQL query to execute"), mcp.Required()),
-	), dbQuery)
+	), pgQuery)
 
-	s.AddTool(mcp.NewTool("list_database_tables",
+	s.AddTool(mcp.NewTool("pg_list_tables",
 		mcp.WithDescription("List all tables in the PostgreSQL database with their schemas."),
-	), dbListTables)
+	), pgListTables)
 }
 
-func connectDB() *sql.DB {
+func connectPG() *sql.DB {
 	password, err := os.ReadFile("/run/secure/service")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "MCP: failed to read DB password: %v (db tools disabled)\n", err)
+		fmt.Fprintf(os.Stderr, "MCP: failed to read PG password: %v (pg tools disabled)\n", err)
 		return nil
 	}
 	pass := strings.TrimSpace(string(password))
 
-	dsn := fmt.Sprintf("user=postgres password=%s dbname=app sslmode=disable connect_timeout=5", pass)
+	dsn := fmt.Sprintf("user=pam password=%s host=/tmp port=5432 dbname=app sslmode=disable", pass)
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "MCP: failed to open DB: %v (db tools disabled)\n", err)
+		fmt.Fprintf(os.Stderr, "MCP: failed to open PG: %v (pg tools disabled)\n", err)
 		return nil
 	}
 
@@ -49,7 +49,7 @@ func connectDB() *sql.DB {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "MCP: DB ping failed: %v (db tools disabled)\n", err)
+		fmt.Fprintf(os.Stderr, "MCP: PG ping failed: %v (pg tools disabled)\n", err)
 		db.Close()
 		return nil
 	}
@@ -57,16 +57,16 @@ func connectDB() *sql.DB {
 	return db
 }
 
-func dbQuery(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if dbPool == nil {
-		return mcp.NewToolResultError("database not available"), nil
+func pgQuery(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if pgPool == nil {
+		return mcp.NewToolResultError("PostgreSQL not available"), nil
 	}
 	query := req.GetString("sql", "")
 	if query == "" {
 		return mcp.NewToolResultError("sql is required"), nil
 	}
 
-	rows, err := dbPool.QueryContext(ctx, query)
+	rows, err := pgPool.QueryContext(ctx, query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("query failed: %v", err)), nil
 	}
@@ -97,11 +97,11 @@ func dbQuery(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult,
 	return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
 }
 
-func dbListTables(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if dbPool == nil {
-		return mcp.NewToolResultError("database not available"), nil
+func pgListTables(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if pgPool == nil {
+		return mcp.NewToolResultError("PostgreSQL not available"), nil
 	}
-	rows, err := dbPool.QueryContext(ctx, `
+	rows, err := pgPool.QueryContext(ctx, `
 		SELECT table_schema, table_name
 		FROM information_schema.tables
 		WHERE table_schema NOT IN ('pg_catalog', 'information_schema')

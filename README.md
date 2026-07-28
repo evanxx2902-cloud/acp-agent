@@ -95,8 +95,8 @@ EOF
 | 值 | 说明 | 示例 |
 |----|------|------|
 | `stdio` | 标准输入输出（默认） | `./agent-server` |
-| `tcp:PORT` | TCP 端口监听，支持多客户端并发 | `./agent-server -listen tcp:8080` |
-| `unix:PATH` | Unix domain socket | `./agent-server -listen unix:/tmp/acp.sock` |
+| `tcp://host:port` | TCP 监听，支持多客户端并发 | `./agent-server -listen tcp://0.0.0.0:8080` |
+| `unix:///path` | Unix domain socket | `./agent-server -listen unix:///tmp/acp.sock` |
 
 ## ACP 协议支持
 
@@ -172,7 +172,7 @@ acp/
 │       ├── server.go    # MCP server 编排
 │       ├── tools_fs.go       # 8 个 filesystem 工具
 │       ├── tools_terminal.go # run_command
-│       ├── tools_db.go       # PostgreSQL 查询 + 表列表
+│       ├── tools_pg.go       # PostgreSQL 查询 + 表列表
 │       └── helpers.go        # 公共工具函数
 ├── go.mod / go.sum
 └── README.md
@@ -284,7 +284,7 @@ go run main.go /home/evan/acp/agent-server -config /home/evan/acp/config.json
 
 ```bash
 # 终端 1：启动 agent，监听 TCP 端口
-./agent-server -config config.json -listen tcp:8080
+./agent-server -config config.json -listen tcp://0.0.0.0:8080
 
 # 终端 2：demo 客户端通过 TCP 连接
 go run ./examples/demo/ -y --connect tcp://localhost:8080

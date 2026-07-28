@@ -58,11 +58,11 @@ func main() {
 	sessionMgr := NewSessionManager(store)
 
 	switch {
-	case strings.HasPrefix(cfg.Listen, "tcp:"):
-		addr := strings.TrimPrefix(cfg.Listen, "tcp:")
+	case strings.HasPrefix(cfg.Listen, "tcp://"):
+		addr := strings.TrimPrefix(cfg.Listen, "tcp://")
 		serveTCP(ctx, addr, cfg, chatModel, sessionMgr, logger)
-	case strings.HasPrefix(cfg.Listen, "unix:"):
-		path := strings.TrimPrefix(cfg.Listen, "unix:")
+	case strings.HasPrefix(cfg.Listen, "unix://"):
+		path := strings.TrimPrefix(cfg.Listen, "unix://")
 		serveUnix(ctx, path, cfg, chatModel, sessionMgr, logger)
 	default:
 		serveStdio(cfg, chatModel, sessionMgr, logger)
