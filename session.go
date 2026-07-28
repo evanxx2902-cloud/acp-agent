@@ -2,15 +2,23 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
-
+	_ "modernc.org/sqlite"
 )
 
-// Session holds per-session runtime state.
-// Messages are persisted to SQLite via the Store after every mutation.
+// =========================================================================
+// Session — per-session runtime state
+// =========================================================================
+
 type Session struct {
 	ID       string
 	mu       sync.Mutex
@@ -18,14 +26,10 @@ type Session struct {
 	cancel   context.CancelFunc
 	store    *Store
 
-	// MCP integration
 	mcpManager *Manager
-
-	// Per-session ChatModelAgent (may include MCP-discovered tools)
-	cmAgent *adk.ChatModelAgent
+	cmAgent    *adk.ChatModelAgent
 }
 
-// AppendMessages appends messages and persists to the database.
 func (s *Session) AppendMessages(msgs ...*schema.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -35,7 +39,6 @@ func (s *Session) AppendMessages(msgs ...*schema.Message) {
 	}
 }
 
-// Messages returns a copy of the session's message history.
 func (s *Session) Messages() []*schema.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -44,14 +47,12 @@ func (s *Session) Messages() []*schema.Message {
 	return cp
 }
 
-// SetCancel stores the cancel function for the current turn.
 func (s *Session) SetCancel(cancel context.CancelFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cancel = cancel
 }
 
-// Cancel calls the stored cancel function (if any).
 func (s *Session) Cancel() {
 	s.mu.Lock()
 	cancel := s.cancel
@@ -62,7 +63,6 @@ func (s *Session) Cancel() {
 	}
 }
 
-// SetMCAgent stores the per-session ChatModelAgent and MCP manager.
 func (s *Session) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *Manager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -70,14 +70,12 @@ func (s *Session) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *Manager) {
 	s.mcpManager = mgr
 }
 
-// GetAgent returns the session's ChatModelAgent.
 func (s *Session) GetAgent() *adk.ChatModelAgent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cmAgent
 }
 
-// CloseMCP releases MCP connections for this session.
 func (s *Session) CloseMCP() {
 	s.mu.Lock()
 	mgr := s.mcpManager
@@ -88,14 +86,16 @@ func (s *Session) CloseMCP() {
 	}
 }
 
-// SessionManager manages the in-memory session map backed by a SQLite Store.
+// =========================================================================
+// SessionManager — in-memory map backed by SQLite Store
+// =========================================================================
+
 type SessionManager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	store    *Store
 }
 
-// NewSessionManager creates a new session manager.
 func NewSessionManager(store *Store) *SessionManager {
 	return &SessionManager{
 		sessions: make(map[string]*Session),
@@ -103,7 +103,6 @@ func NewSessionManager(store *Store) *SessionManager {
 	}
 }
 
-// Create creates a new session, persists it to the DB, and adds the initial messages.
 func (sm *SessionManager) Create(id string, initialMessages ...*schema.Message) (*Session, error) {
 	if err := sm.store.CreateSession(id); err != nil {
 		return nil, err
@@ -125,7 +124,6 @@ func (sm *SessionManager) Create(id string, initialMessages ...*schema.Message) 
 	return s, nil
 }
 
-// Get retrieves an active session from memory.
 func (sm *SessionManager) Get(id string) (*Session, bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -133,7 +131,6 @@ func (sm *SessionManager) Get(id string) (*Session, bool) {
 	return s, ok
 }
 
-// Load restores a session from the DB and brings it into memory.
 func (sm *SessionManager) Load(id string) (*Session, error) {
 	msgs, err := sm.store.LoadMessages(id)
 	if err != nil {
@@ -152,7 +149,6 @@ func (sm *SessionManager) Load(id string) (*Session, error) {
 	return s, nil
 }
 
-// Delete removes a session from memory and DB.
 func (sm *SessionManager) Delete(id string) {
 	sm.mu.Lock()
 	delete(sm.sessions, id)
@@ -160,12 +156,129 @@ func (sm *SessionManager) Delete(id string) {
 	_ = sm.store.DeleteSession(id)
 }
 
-// List returns metadata for all persisted sessions.
 func (sm *SessionManager) List() ([]SessionMeta, error) {
 	return sm.store.ListSessions()
 }
 
-// Exists checks if a session exists in the DB.
 func (sm *SessionManager) Exists(id string) (bool, error) {
 	return sm.store.SessionExists(id)
+}
+
+// =========================================================================
+// Store — SQLite persistence
+// =========================================================================
+
+type SessionMeta struct {
+	ID        string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type Store struct {
+	db *sql.DB
+}
+
+func NewStore(dbPath string) (*Store, error) {
+	dir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create data dir %s: %w", dir, err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable WAL: %w", err)
+	}
+
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS sessions (
+			id TEXT PRIMARY KEY,
+			messages TEXT NOT NULL DEFAULT '[]',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)
+	`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create schema: %w", err)
+	}
+
+	return &Store{db: db}, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) CreateSession(id string) error {
+	now := time.Now().Unix()
+	_, err := s.db.Exec(
+		"INSERT INTO sessions (id, messages, created_at, updated_at) VALUES (?, '[]', ?, ?)",
+		id, now, now,
+	)
+	return err
+}
+
+func (s *Store) DeleteSession(id string) error {
+	_, err := s.db.Exec("DELETE FROM sessions WHERE id = ?", id)
+	return err
+}
+
+func (s *Store) ListSessions() ([]SessionMeta, error) {
+	rows, err := s.db.Query("SELECT id, created_at, updated_at FROM sessions ORDER BY updated_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SessionMeta
+	for rows.Next() {
+		var m SessionMeta
+		var ca, ua int64
+		if err := rows.Scan(&m.ID, &ca, &ua); err != nil {
+			return nil, err
+		}
+		m.CreatedAt = time.Unix(ca, 0)
+		m.UpdatedAt = time.Unix(ua, 0)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SessionExists(id string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?)", id).Scan(&exists)
+	return exists, err
+}
+
+func (s *Store) LoadMessages(id string) ([]*schema.Message, error) {
+	var raw string
+	if err := s.db.QueryRow("SELECT messages FROM sessions WHERE id = ?", id).Scan(&raw); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("session %s not found", id)
+		}
+		return nil, err
+	}
+	if raw == "" || raw == "[]" {
+		return nil, nil
+	}
+	var msgs []*schema.Message
+	if err := json.Unmarshal([]byte(raw), &msgs); err != nil {
+		return nil, fmt.Errorf("unmarshal messages for session %s: %w", id, err)
+	}
+	return msgs, nil
+}
+
+func (s *Store) SaveMessages(id string, msgs []*schema.Message) error {
+	data, err := json.Marshal(msgs)
+	if err != nil {
+		return fmt.Errorf("marshal messages: %w", err)
+	}
+	now := time.Now().Unix()
+	_, err = s.db.Exec(
+		"UPDATE sessions SET messages = ?, updated_at = ? WHERE id = ?",
+		string(data), now, id,
+	)
+	return err
 }

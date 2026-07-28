@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -16,16 +18,51 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
-
 )
 
-// Ensure EinoAgent satisfies the required interfaces.
+func main() {
+	cfg := LoadConfig()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+
+	store, err := NewStore(cfg.DBPath)
+	if err != nil {
+		slog.Error("failed to open session store", "path", cfg.DBPath, "error", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+	slog.Info("session store opened", "path", cfg.DBPath)
+
+	chatModel, err := NewChatModel(ctx, cfg)
+	if err != nil {
+		slog.Error("failed to create chat model", "error", err)
+		os.Exit(1)
+	}
+
+	ag := NewEinoAgent(cfg, chatModel, store)
+	conn := acp.NewAgentSideConnection(ag, os.Stdout, os.Stdin)
+	conn.SetLogger(logger)
+	ag.SetAgentConnection(conn)
+
+	slog.Info("agent server started", "version", acp.ProtocolVersionNumber)
+
+	<-conn.Done()
+	slog.Info("agent server shutting down")
+}
+
+// =========================================================================
+// EinoAgent — implements acp.Agent
+// =========================================================================
+
 var (
 	_ acp.Agent       = (*EinoAgent)(nil)
 	_ acp.AgentLoader = (*EinoAgent)(nil)
 )
 
-// EinoAgent implements acp.Agent, backed by eino's ChatModelAgent.
 type EinoAgent struct {
 	cfg       Config
 	chatModel model.ToolCallingChatModel
@@ -34,7 +71,6 @@ type EinoAgent struct {
 	connMu    sync.Mutex
 }
 
-// NewEinoAgent creates a new EinoAgent with the given config, chat model, and session store.
 func NewEinoAgent(cfg Config, chatModel model.ToolCallingChatModel, store *Store) *EinoAgent {
 	return &EinoAgent{
 		cfg:       cfg,
@@ -43,7 +79,6 @@ func NewEinoAgent(cfg Config, chatModel model.ToolCallingChatModel, store *Store
 	}
 }
 
-// SetAgentConnection stores the ACP connection reference.
 func (a *EinoAgent) SetAgentConnection(conn *acp.AgentSideConnection) {
 	a.connMu.Lock()
 	a.conn = conn
@@ -56,8 +91,6 @@ func (a *EinoAgent) getConn() *acp.AgentSideConnection {
 	return a.conn
 }
 
-// buildSessionAgent constructs a ChatModelAgent for a specific session,
-// combining base tools with MCP-discovered tools.
 func (a *EinoAgent) buildSessionAgent(tools []tool.BaseTool) (*adk.ChatModelAgent, error) {
 	toolsConfig := adk.ToolsConfig{}
 	toolsConfig.Tools = tools
@@ -72,9 +105,7 @@ func (a *EinoAgent) buildSessionAgent(tools []tool.BaseTool) (*adk.ChatModelAgen
 	})
 }
 
-// --------------------------------------------------------------------------
-// acp.Agent interface
-// --------------------------------------------------------------------------
+// --- acp.Agent methods ---
 
 func (a *EinoAgent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
 	return acp.InitializeResponse{
@@ -107,13 +138,10 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
 
-	// Connect MCP servers and discover tools
 	mcpMgr := &Manager{}
 	mcpTools, _ := mcpMgr.Connect(ctx, params.McpServers)
 
-	// Build session-specific agent: all tools come from MCP
-	allTools := mcpTools
-	cmAgent, err := a.buildSessionAgent(allTools)
+	cmAgent, err := a.buildSessionAgent(mcpTools)
 	if err != nil {
 		mcpMgr.Close()
 		return acp.NewSessionResponse{}, fmt.Errorf("build agent: %w", err)
@@ -125,8 +153,6 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 }
 
 func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	// If the session is not yet in memory, load it from the DB.
-	// Note: MCP tools are NOT reconnected on load (they're ephemeral per original session creation).
 	if _, ok := a.sessions.Get(string(params.SessionId)); !ok {
 		_, err := a.sessions.Load(string(params.SessionId))
 		if err != nil {
@@ -151,7 +177,6 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 		return acp.PromptResponse{}, fmt.Errorf("session %s not found", sid)
 	}
 
-	// Cancel any previous turn for this session
 	s.Cancel()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -163,23 +188,18 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 		return acp.PromptResponse{}, fmt.Errorf("agent connection not set")
 	}
 
-	// Inject ACP connection context so tools can access the connection
 	ctx = ContextWithACP(ctx, conn, acp.SessionId(sid))
 
-	// Convert ACP content blocks to eino message and append to history
 	userMsg := ContentBlocksToMessage(params.Prompt)
 	s.AppendMessages(userMsg)
 
-	// Build the full message list for this turn
 	messages := s.Messages()
 
-	// Get the session-specific agent
 	cmAgent := s.GetAgent()
 	if cmAgent == nil {
 		return acp.PromptResponse{}, fmt.Errorf("agent not initialized for session %s", sid)
 	}
 
-	// Create runner and execute
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
 		Agent:           cmAgent,
 		EnableStreaming: true,
@@ -187,7 +207,6 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 
 	iter := runner.Run(ctx, messages)
 
-	// Process agent events - streaming + message collection
 	var finalContent strings.Builder
 	for {
 		event, ok := iter.Next()
@@ -204,14 +223,12 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 		}
 
 		if event.Output != nil && event.Output.MessageOutput != nil {
-			err := ProcessAgentEvent(ctx, conn, sid, event, &finalContent)
-			if err != nil {
+			if err := ProcessAgentEvent(ctx, conn, sid, event, &finalContent); err != nil {
 				slog.Error("failed to process agent event", "error", err)
 			}
 		}
 	}
 
-	// Store the assistant's final response in session history (auto-persists via write-through)
 	responseText := finalContent.String()
 	if responseText != "" {
 		s.AppendMessages(schema.AssistantMessage(responseText, nil))
@@ -265,9 +282,193 @@ func (a *EinoAgent) Logout(ctx context.Context, params acp.LogoutRequest) (acp.L
 	return acp.LogoutResponse{}, acp.NewMethodNotFound(acp.AgentMethodLogout)
 }
 
-// --------------------------------------------------------------------------
+// =========================================================================
+// ACP context helpers (injected into context for tool access)
+// =========================================================================
+
+type acpContextKey struct{}
+
+type acpContext struct {
+	Conn      *acp.AgentSideConnection
+	SessionID acp.SessionId
+}
+
+func ContextWithACP(ctx context.Context, conn *acp.AgentSideConnection, sessionID acp.SessionId) context.Context {
+	return context.WithValue(ctx, acpContextKey{}, &acpContext{
+		Conn:      conn,
+		SessionID: sessionID,
+	})
+}
+
+func getACPContext(ctx context.Context) (*acp.AgentSideConnection, acp.SessionId) {
+	if v, ok := ctx.Value(acpContextKey{}).(*acpContext); ok {
+		return v.Conn, v.SessionID
+	}
+	return nil, ""
+}
+
+// =========================================================================
+// ACP ContentBlock → eino Message
+// =========================================================================
+
+func ContentBlocksToMessage(blocks []acp.ContentBlock) *schema.Message {
+	var textParts []string
+	var imageParts []schema.MessageInputPart
+
+	for _, block := range blocks {
+		switch {
+		case block.Text != nil:
+			textParts = append(textParts, block.Text.Text)
+		case block.Image != nil:
+			imageParts = append(imageParts, schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeImageURL,
+				Image: &schema.MessageInputImage{
+					MessagePartCommon: schema.MessagePartCommon{
+						Base64Data: &block.Image.Data,
+						MIMEType:   block.Image.MimeType,
+					},
+				},
+			})
+		case block.ResourceLink != nil:
+			textParts = append(textParts,
+				fmt.Sprintf("[Resource: %s](%s)", block.ResourceLink.Name, block.ResourceLink.Uri))
+		case block.Resource != nil:
+			if block.Resource.Resource.TextResourceContents != nil {
+				textParts = append(textParts, block.Resource.Resource.TextResourceContents.Text)
+			}
+		case block.Audio != nil:
+			textParts = append(textParts, "[Audio content attached]")
+		}
+	}
+
+	textContent := strings.Join(textParts, "\n")
+
+	if len(imageParts) > 0 {
+		parts := make([]schema.MessageInputPart, 0, len(imageParts)+1)
+		if textContent != "" {
+			parts = append(parts, schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeText,
+				Text: textContent,
+			})
+		}
+		parts = append(parts, imageParts...)
+		return &schema.Message{
+			Role:                schema.User,
+			UserInputMultiContent: parts,
+		}
+	}
+
+	return schema.UserMessage(textContent)
+}
+
+// =========================================================================
+// eino AgentEvent → ACP SessionUpdate streaming
+// =========================================================================
+
+func ProcessAgentEvent(
+	ctx context.Context,
+	conn *acp.AgentSideConnection,
+	sid string,
+	event *adk.AgentEvent,
+	finalContent *strings.Builder,
+) error {
+	mv := event.Output.MessageOutput
+	if mv.IsStreaming {
+		return processStreaming(ctx, conn, sid, mv, finalContent)
+	}
+	return processNonStreaming(ctx, conn, sid, mv, finalContent)
+}
+
+func processStreaming(
+	ctx context.Context,
+	conn *acp.AgentSideConnection,
+	sid string,
+	mv *adk.MessageVariant,
+	finalContent *strings.Builder,
+) error {
+	msgStream := mv.MessageStream
+	if msgStream == nil {
+		return nil
+	}
+
+	for {
+		chunk, err := msgStream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if chunk == nil {
+			continue
+		}
+
+		switch mv.Role {
+		case schema.Assistant:
+			if chunk.Content != "" {
+				if err := conn.SessionUpdate(ctx, acp.SessionNotification{
+					SessionId: acp.SessionId(sid),
+					Update:    acp.UpdateAgentMessageText(chunk.Content),
+				}); err != nil {
+					return err
+				}
+				finalContent.WriteString(chunk.Content)
+			}
+			if chunk.ReasoningContent != "" {
+				if err := conn.SessionUpdate(ctx, acp.SessionNotification{
+					SessionId: acp.SessionId(sid),
+					Update:    acp.UpdateAgentThoughtText(chunk.ReasoningContent),
+				}); err != nil {
+					return err
+				}
+			}
+		case schema.Tool:
+			slog.Debug("streaming tool result", "toolName", mv.ToolName, "content", chunk.Content)
+		}
+	}
+	return nil
+}
+
+func processNonStreaming(
+	ctx context.Context,
+	conn *acp.AgentSideConnection,
+	sid string,
+	mv *adk.MessageVariant,
+	finalContent *strings.Builder,
+) error {
+	msg := mv.Message
+	if msg == nil {
+		return nil
+	}
+
+	switch mv.Role {
+	case schema.Assistant:
+		if msg.Content != "" {
+			if err := conn.SessionUpdate(ctx, acp.SessionNotification{
+				SessionId: acp.SessionId(sid),
+				Update:    acp.UpdateAgentMessageText(msg.Content),
+			}); err != nil {
+				return err
+			}
+			finalContent.WriteString(msg.Content)
+		}
+		if msg.ReasoningContent != "" {
+			if err := conn.SessionUpdate(ctx, acp.SessionNotification{
+				SessionId: acp.SessionId(sid),
+				Update:    acp.UpdateAgentThoughtText(msg.ReasoningContent),
+			}); err != nil {
+				return err
+			}
+		}
+	case schema.Tool:
+		slog.Debug("non-streaming tool result", "toolName", mv.ToolName, "content", msg.Content)
+	}
+	return nil
+}
+
+// =========================================================================
 // Helpers
-// --------------------------------------------------------------------------
+// =========================================================================
 
 func randomID() string {
 	var b [12]byte

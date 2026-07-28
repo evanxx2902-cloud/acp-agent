@@ -13,21 +13,100 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
+	mcpclient "github.com/mark3labs/mcp-go/client"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
 
-// ToolAdapter wraps an MCP tool as an eino tool.InvokableTool.
+// =========================================================================
+// MCP Client Manager — connect to MCP servers, discover tools
+// =========================================================================
+
+type Manager struct {
+	clients []*mcpclient.Client
+}
+
+func (m *Manager) Connect(ctx context.Context, servers []acp.McpServer) ([]tool.BaseTool, error) {
+	var allTools []tool.BaseTool
+
+	for i, server := range servers {
+		if server.Stdio == nil {
+			continue
+		}
+
+		cli, tools, err := connectStdio(ctx, server.Stdio)
+		if err != nil {
+			slog.Error("failed to connect to MCP server",
+				"index", i, "command", server.Stdio.Command, "error", err,
+			)
+			continue
+		}
+
+		m.clients = append(m.clients, cli)
+		allTools = append(allTools, tools...)
+		slog.Info("connected to MCP server", "command", server.Stdio.Command, "tools", len(tools))
+	}
+
+	return allTools, nil
+}
+
+func connectStdio(ctx context.Context, stdio *acp.McpServerStdio) (*mcpclient.Client, []tool.BaseTool, error) {
+	cli, err := mcpclient.NewStdioMCPClient(stdio.Command, nil, stdio.Args...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create stdio client: %w", err)
+	}
+
+	initReq := mcpgo.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcpgo.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcpgo.Implementation{Name: "acp-agent", Version: "0.1.0"}
+	initReq.Params.Capabilities = mcpgo.ClientCapabilities{}
+
+	if _, err := cli.Initialize(ctx, initReq); err != nil {
+		cli.Close()
+		return nil, nil, fmt.Errorf("initialize: %w", err)
+	}
+
+	toolsResp, err := cli.ListTools(ctx, mcpgo.ListToolsRequest{})
+	if err != nil {
+		cli.Close()
+		return nil, nil, fmt.Errorf("list tools: %w", err)
+	}
+
+	var einoTools []tool.BaseTool
+	for _, mcpTool := range toolsResp.Tools {
+		t := mcpTool
+		adapter, err := NewToolAdapter(t, cli)
+		if err != nil {
+			slog.Warn("skipping MCP tool with bad schema", "name", t.Name, "error", err)
+			continue
+		}
+		einoTools = append(einoTools, adapter)
+	}
+
+	return cli, einoTools, nil
+}
+
+func (m *Manager) Close() {
+	for _, cli := range m.clients {
+		if err := cli.Close(); err != nil {
+			slog.Debug("error closing MCP client", "error", err)
+		}
+	}
+	m.clients = nil
+}
+
+// =========================================================================
+// ToolAdapter — wraps MCP tool as eino BaseTool
+// =========================================================================
+
+type MCPCaller interface {
+	CallTool(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)
+}
+
 type ToolAdapter struct {
 	info   *schema.ToolInfo
 	client MCPCaller
 }
 
-// MCPCaller is the subset of MCP client methods we need for tool calls.
-type MCPCaller interface {
-	CallTool(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)
-}
-
-// NewToolAdapter creates an eino tool from an MCP tool definition.
 func NewToolAdapter(mcpTool mcpgo.Tool, client MCPCaller) (*ToolAdapter, error) {
 	info := &schema.ToolInfo{
 		Name: "mcp__" + mcpTool.Name,
@@ -42,18 +121,13 @@ func NewToolAdapter(mcpTool mcpgo.Tool, client MCPCaller) (*ToolAdapter, error) 
 		info.ParamsOneOf = schema.NewParamsOneOfByJSONSchema(&js)
 	}
 
-	return &ToolAdapter{
-		info:   info,
-		client: client,
-	}, nil
+	return &ToolAdapter{info: info, client: client}, nil
 }
 
-// Info returns the eino tool metadata.
 func (t *ToolAdapter) Info(ctx context.Context) (*schema.ToolInfo, error) {
 	return t.info, nil
 }
 
-// InvokableRun calls the MCP tool with ACP notifications and permission checks.
 func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
 	var args map[string]any
 	if argumentsInJSON != "" && argumentsInJSON != "{}" {
@@ -67,23 +141,17 @@ func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, 
 	toolCallID := acp.ToolCallId("mcp_" + mcpShortID())
 	title := fmt.Sprintf("%s(%s)", toolName, summarizeArgs(args, 60))
 
-	// If ACP connection is available, notify the client and ask for permission
+	// ACP notifications + permission
 	if conn != nil {
-		// Notify: tool call starting
-		if err := conn.SessionUpdate(ctx, acp.SessionNotification{
+		_ = conn.SessionUpdate(ctx, acp.SessionNotification{
 			SessionId: sid,
-			Update: acp.StartToolCall(
-				toolCallID,
-				title,
+			Update: acp.StartToolCall(toolCallID, title,
 				acp.WithStartKind(acp.ToolKindOther),
 				acp.WithStartStatus(acp.ToolCallStatusPending),
 				acp.WithStartRawInput(args),
 			),
-		}); err != nil {
-			slog.Error("mcp tool start notification failed", "error", err)
-		}
+		})
 
-		// Ask permission
 		permResp, err := conn.RequestPermission(ctx, acp.RequestPermissionRequest{
 			SessionId: sid,
 			ToolCall: acp.ToolCallUpdate{
@@ -100,18 +168,7 @@ func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, 
 		})
 		if err != nil {
 			slog.Error("permission request failed", "error", err)
-		} else if permResp.Outcome.Selected == nil {
-			// Cancelled
-			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
-				SessionId: sid,
-				Update: acp.UpdateToolCall(toolCallID,
-					acp.WithUpdateStatus(acp.ToolCallStatusFailed),
-					acp.WithUpdateTitle(title+" (cancelled)"),
-				),
-			})
-			return "cancelled by user", nil
-		} else if string(permResp.Outcome.Selected.OptionId) != "allow" {
-			// Rejected
+		} else if permResp.Outcome.Selected == nil || string(permResp.Outcome.Selected.OptionId) != "allow" {
 			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
 				SessionId: sid,
 				Update: acp.UpdateToolCall(toolCallID,
@@ -122,24 +179,17 @@ func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, 
 			return "rejected by user", nil
 		}
 
-		// Allowed — update status to in-progress
 		_ = conn.SessionUpdate(ctx, acp.SessionNotification{
 			SessionId: sid,
-			Update: acp.UpdateToolCall(toolCallID,
-				acp.WithUpdateStatus(acp.ToolCallStatusInProgress),
-			),
+			Update:    acp.UpdateToolCall(toolCallID, acp.WithUpdateStatus(acp.ToolCallStatusInProgress)),
 		})
 	}
 
 	// Execute via MCP
 	result, err := t.client.CallTool(ctx, mcpgo.CallToolRequest{
-		Params: mcpgo.CallToolParams{
-			Name:      toolName,
-			Arguments: args,
-		},
+		Params: mcpgo.CallToolParams{Name: toolName, Arguments: args},
 	})
 
-	// Notify result
 	if conn != nil {
 		if err != nil {
 			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
@@ -150,13 +200,13 @@ func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, 
 				),
 			})
 		} else {
-			output := extractToolResult(result)
+			output := extractResult(result)
 			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
 				SessionId: sid,
 				Update: acp.UpdateToolCall(toolCallID,
 					acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
 					acp.WithUpdateTitle(title),
-					acp.WithUpdateContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(truncateText(output, 500)))}),
+					acp.WithUpdateContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(trunc(output, 500)))}),
 					acp.WithUpdateRawOutput(map[string]any{"result": output}),
 				),
 			})
@@ -166,61 +216,36 @@ func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, 
 	if err != nil {
 		return "", fmt.Errorf("mcp tool call failed: %w", err)
 	}
-	return extractToolResult(result), nil
+	return extractResult(result), nil
 }
 
-// extractToolResult extracts human-readable text from an MCP tool result.
-func extractToolResult(result *mcpgo.CallToolResult) string {
-	if result == nil {
-		return "(empty result)"
+func extractResult(r *mcpgo.CallToolResult) string {
+	if r == nil {
+		return "(empty)"
 	}
-
 	var texts []string
-	for _, content := range result.Content {
-		switch c := content.(type) {
+	for _, c := range r.Content {
+		switch c := c.(type) {
 		case mcpgo.TextContent:
 			texts = append(texts, c.Text)
 		case mcpgo.ImageContent:
-			texts = append(texts, fmt.Sprintf("[image: %s]", c.MIMEType))
-		case mcpgo.EmbeddedResource:
-			texts = append(texts, fmt.Sprintf("[embedded resource]"))
+			texts = append(texts, "[image]")
 		default:
-			texts = append(texts, fmt.Sprintf("[content: %T]", c))
+			texts = append(texts, fmt.Sprintf("[%T]", c))
 		}
 	}
-
 	if len(texts) == 0 {
-		if result.IsError {
-			return "(tool error, no message)"
+		if r.IsError {
+			return "(error)"
 		}
 		return "(ok)"
 	}
-
-	return joinNonEmpty(texts, "\n")
-}
-
-func joinNonEmpty(ss []string, sep string) string {
-	var filtered []string
-	for _, s := range ss {
-		if s != "" {
-			filtered = append(filtered, s)
-		}
-	}
-	if len(filtered) == 0 {
-		return ""
-	}
-	result := filtered[0]
-	for _, s := range filtered[1:] {
-		result += sep + s
-	}
-	return result
+	return strings.Join(texts, "\n")
 }
 
 func mcpShortID() string {
 	var b [4]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "deadbeef"
-	}
+	rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
 
@@ -243,7 +268,7 @@ func summarizeArgs(args map[string]any, maxLen int) string {
 	return joined
 }
 
-func truncateText(s string, maxLen int) string {
+func trunc(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
