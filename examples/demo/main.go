@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,16 +14,20 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "--mcp-server" {
+	autoYes := flag.Bool("y", false, "Auto-approve all tool permissions")
+	flag.Parse()
+
+	if flag.Arg(0) == "--mcp-server" {
 		runMCPServer()
 		return
 	}
-	runDemo()
+	runDemo(*autoYes)
 }
 
 // =========================================================================
@@ -96,9 +101,118 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithString("command", mcp.Description("Shell command to execute"), mcp.Required()),
 		mcp.WithString("workdir", mcp.Description("Working directory (optional)")),
 	), handleRunCommand)
+
+	// Database tools
+	dbPool := connectDB()
+	s.AddTool(mcp.NewTool("query_database",
+		mcp.WithDescription("Execute a read-only SQL query against the PostgreSQL database and return results."),
+		mcp.WithString("sql", mcp.Description("SQL SELECT query to execute"), mcp.Required()),
+	), makeHandleQueryDB(dbPool))
+
+	s.AddTool(mcp.NewTool("list_database_tables",
+		mcp.WithDescription("List all tables in the PostgreSQL database with their schemas."),
+	), makeHandleListTables(dbPool))
 }
 
-// --- Tool Handlers ---
+// =========================================================================
+// Database
+// =========================================================================
+
+func connectDB() *pgxpool.Pool {
+	password, err := os.ReadFile("/run/secure/service")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "MCP server: failed to read DB password: %v (db tools disabled)\n", err)
+		return nil
+	}
+	pass := strings.TrimSpace(string(password))
+
+	// Connect via Unix socket at /tmp
+	connStr := fmt.Sprintf("host=/tmp user=pam password=%s dbname=postgres sslmode=disable", pass)
+	pool, err := pgxpool.New(context.Background(), connStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "MCP server: failed to connect to DB: %v (db tools disabled)\n", err)
+		return nil
+	}
+	return pool
+}
+
+func makeHandleQueryDB(pool *pgxpool.Pool) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if pool == nil {
+			return mcp.NewToolResultError("database not available"), nil
+		}
+		sql := req.GetString("sql", "")
+		if sql == "" {
+			return mcp.NewToolResultError("sql is required"), nil
+		}
+
+		rows, err := pool.Query(ctx, sql)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("query failed: %v", err)), nil
+		}
+		defer rows.Close()
+
+		// Build table output
+		descriptions := rows.FieldDescriptions()
+		var headers []string
+		for _, d := range descriptions {
+			headers = append(headers, string(d.Name))
+		}
+
+		var lines []string
+		lines = append(lines, strings.Join(headers, "\t"))
+
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				continue
+			}
+			var cols []string
+			for _, v := range vals {
+				cols = append(cols, fmt.Sprintf("%v", v))
+			}
+			lines = append(lines, strings.Join(cols, "\t"))
+		}
+
+		if len(lines) <= 1 {
+			return mcp.NewToolResultText("(empty result)"), nil
+		}
+		return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
+	}
+}
+
+func makeHandleListTables(pool *pgxpool.Pool) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if pool == nil {
+			return mcp.NewToolResultError("database not available"), nil
+		}
+		rows, err := pool.Query(ctx, `
+			SELECT table_schema, table_name
+			FROM information_schema.tables
+			WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+			ORDER BY table_schema, table_name
+		`)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("list tables failed: %v", err)), nil
+		}
+		defer rows.Close()
+
+		var lines []string
+		for rows.Next() {
+			var schema, name string
+			rows.Scan(&schema, &name)
+			lines = append(lines, fmt.Sprintf("%s.%s", schema, name))
+		}
+		if len(lines) == 0 {
+			return mcp.NewToolResultText("(no tables)"), nil
+		}
+		return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
+	}
+}
+
+// =========================================================================
+// Tool Handlers
+// =========================================================================
 
 func handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	path := req.GetString("path", "")
@@ -246,24 +360,26 @@ func handleRunCommand(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 // Mode 2: Demo Client
 // =========================================================================
 
-func runDemo() {
+func runDemo(autoYes bool) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer cancel()
 
-	// Find our own binary path for spawning the MCP server
 	selfPath, _ := os.Executable()
 	if selfPath == "" {
 		selfPath, _ = filepath.Abs(os.Args[0])
 	}
 
-	// Find the agent binary
 	agentPath := findAgentBinary()
 
 	fmt.Println("=== ACP Agent Demo ===\n")
-	fmt.Printf("Agent:   %s\n", agentPath)
-	fmt.Printf("MCP:     %s --mcp-server\n\n", selfPath)
+	fmt.Printf("Agent:    %s\n", agentPath)
+	fmt.Printf("MCP:      %s --mcp-server\n", selfPath)
+	if autoYes {
+		fmt.Println("Auto-yes: enabled\n")
+	} else {
+		fmt.Println()
+	}
 
-	// Start the agent
 	agentCmd := exec.CommandContext(ctx, agentPath, "-config", "config.json")
 	agentCmd.Stderr = os.Stderr
 	agentIn, _ := agentCmd.StdinPipe()
@@ -274,11 +390,9 @@ func runDemo() {
 	}
 	defer agentCmd.Process.Kill()
 
-	// Create ACP client
-	client := &demoClient{}
+	client := &demoClient{autoYes: autoYes}
 	conn := acp.NewClientSideConnection(client, agentIn, agentOut)
 
-	// Initialize
 	initResp, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		ClientCapabilities: acp.ClientCapabilities{
@@ -291,7 +405,6 @@ func runDemo() {
 	}
 	fmt.Printf("Connected to agent (protocol v%v)\n\n", initResp.ProtocolVersion)
 
-	// Create session with MCP server
 	newSess, err := conn.NewSession(ctx, acp.NewSessionRequest{
 		Cwd: mustCwd(),
 		McpServers: []acp.McpServer{
@@ -306,11 +419,8 @@ func runDemo() {
 	if err != nil {
 		die("newSession", err)
 	}
-	fmt.Printf("Session: %s\n", newSess.SessionId)
-	fmt.Printf("MCP tools: read_file, write_file, list_directory, make_directory, move_file,\n")
-	fmt.Printf("            delete_file, get_file_info, search_files, run_command\n\n")
+	fmt.Printf("Session: %s\n\n", newSess.SessionId)
 
-	// Interactive prompt loop
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("> ")
@@ -342,7 +452,8 @@ func runDemo() {
 }
 
 type demoClient struct {
-	output strings.Builder
+	output  strings.Builder
+	autoYes bool
 }
 
 func (c *demoClient) reset() { c.output.Reset() }
@@ -373,7 +484,6 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 		}
 		switch status {
 		case "pending":
-			// already shown by ToolCall event
 		case "in_progress":
 			fmt.Print("  ⏳ running...")
 		case "completed":
@@ -387,7 +497,6 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 }
 
 func (c *demoClient) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	// Print what the tool wants to do
 	title := ""
 	if params.ToolCall.Title != nil {
 		title = *params.ToolCall.Title
@@ -399,6 +508,13 @@ func (c *demoClient) RequestPermission(ctx context.Context, params acp.RequestPe
 		fmt.Printf("│ args: %s\n", string(b))
 	}
 	fmt.Printf("└──────────────────────────────────────┘\n")
+
+	if c.autoYes {
+		fmt.Println("✓ Auto-allowed (--yes)\n")
+		return acp.RequestPermissionResponse{
+			Outcome: acp.NewRequestPermissionOutcomeSelected("allow"),
+		}, nil
+	}
 
 	fmt.Print("Allow? [y/N] ")
 	reader := bufio.NewReader(os.Stdin)
@@ -418,7 +534,7 @@ func (c *demoClient) RequestPermission(ctx context.Context, params acp.RequestPe
 	}, nil
 }
 
-// Stub implementations — agent uses MCP tools now, not ACP client ops
+// Stub implementations
 func (c *demoClient) ReadTextFile(ctx context.Context, params acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
 	return acp.ReadTextFileResponse{}, fmt.Errorf("not implemented (use MCP tools)")
 }
@@ -444,7 +560,6 @@ func (c *demoClient) KillTerminal(ctx context.Context, params acp.KillTerminalRe
 // --- Helpers ---
 
 func findAgentBinary() string {
-	// Look in current directory and parent
 	candidates := []string{"./agent-server", "../agent-server", "./acp", "../acp"}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
@@ -452,7 +567,6 @@ func findAgentBinary() string {
 			return abs
 		}
 	}
-	// Fallback: try go build
 	fmt.Println("Building agent...")
 	cmd := exec.Command("go", "build", "-o", "/tmp/agent-server", ".")
 	cmd.Dir = findProjectRoot()
@@ -464,7 +578,6 @@ func findAgentBinary() string {
 }
 
 func findProjectRoot() string {
-	// Walk up to find go.mod
 	dir, _ := os.Getwd()
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
