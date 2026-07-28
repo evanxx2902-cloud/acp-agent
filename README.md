@@ -84,8 +84,19 @@ EOF
 | `ACP_SYSTEM_PROMPT` | `system_prompt` | 系统提示词 | 通用助手 |
 | `ACP_DATA_DIR` | `data_dir` | 数据目录 | `~/.acp-agent` |
 | `ACP_DB_PATH` | `db_path` | SQLite 路径 | `$DATA_DIR/sessions.db` |
+| `ACP_LISTEN` | `listen` | 传输模式 | `stdio` |
 
 支持任何兼容 OpenAI API 的 LLM 服务（OpenAI、DeepSeek、Groq、Ollama、vLLM 等）。
+
+### 传输模式
+
+`ACP_LISTEN` 环境变量或 `listen` JSON 字段控制 agent 接受客户端连接的方式。
+
+| 值 | 说明 | 示例 |
+|----|------|------|
+| `stdio` | 标准输入输出（默认） | `./agent-server` |
+| `tcp:PORT` | TCP 端口监听，支持多客户端并发 | `./agent-server -listen tcp:8080` |
+| `unix:PATH` | Unix domain socket | `./agent-server -listen unix:/tmp/acp.sock` |
 
 ## ACP 协议支持
 
@@ -93,7 +104,7 @@ EOF
 
 | 方法 | 状态 | 说明 |
 |------|------|------|
-| `initialize` | ✅ 完整 | 协议版本协商、能力声明（图片输入、session 加载） |
+| `initialize` | ✅ 完整 | 协议版本协商、能力声明（图片输入、session 加载、MCP over HTTP/SSE） |
 | `authenticate` | ✅ 通过 | 无认证，直接返回成功 |
 | `session/new` | ✅ 完整 | 创建 session，自动连接 MCP server 并发现工具 |
 | `session/load` | ✅ 完整 | 从 SQLite 恢复 session |
@@ -180,6 +191,17 @@ acp/
 5. 返回 PromptResponse(stopReason=end_turn)
 ```
 
+### MCP 传输方式
+
+Agent 支持连接 4 种类型的 MCP server，客户端在 `session/new` 时通过 `McpServers` 字段指定。
+
+| 传输类型 | 状态 | 配置字段 | 说明 |
+|---------|------|---------|------|
+| Stdio | ✅ | `McpServer.Stdio{Command, Args}` | 启动子进程，通过 stdin/stdout 通信 |
+| HTTP | ✅ | `McpServer.Http{Url, Headers}` | Streamable HTTP 协议 |
+| SSE | ✅ | `McpServer.Sse{Url, Headers}` | Server-Sent Events 协议 |
+| ACP | ⚠️ | `McpServer.Acp{Id}` | 通过 ACP 组件传输（协议尚不稳定） |
+
 ## 测试
 
 ### 使用 demo 客户端（推荐）
@@ -249,6 +271,28 @@ go run main.go /home/evan/acp/agent-server -config /home/evan/acp/config.json
 ```
 
 > **注意**：acp-go-sdk 自带客户端不在 `NewSession` 中配置 `McpServers`，因此 agent 会以零工具的状态运行。如需测试工具调用，推荐使用 demo 客户端。
+
+### TCP / Unix Socket 测试
+
+**TCP 模式**：
+
+```bash
+# 终端 1：启动 agent，监听 TCP 端口
+./agent-server -config config.json -listen tcp:8080
+
+# 终端 2：demo 客户端通过 TCP 连接
+go run ./examples/demo/ -y --connect tcp://localhost:8080
+```
+
+**Unix Socket 模式**：
+
+```bash
+# 终端 1：启动 agent，监听 Unix socket
+./agent-server -config config.json -listen unix:/tmp/acp.sock
+
+# 终端 2：demo 客户端通过 socket 连接
+go run ./examples/demo/ -y --connect unix:///tmp/acp.sock
+```
 
 ## 扩展指南
 
