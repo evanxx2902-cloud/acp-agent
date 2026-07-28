@@ -23,15 +23,16 @@ func main() {
 	autoYes := flag.Bool("y", false, "Auto-approve all tool permissions")
 	mode := flag.String("mode", "agent", "Session mode: 'agent' or 'plan'")
 	connect := flag.String("connect", "", "Connect to running agent: tcp://host:port or unix:///path/to/sock")
+	sysPrompt := flag.String("system-prompt", "", "Override system prompt for the session")
 	flag.Parse()
-	runClient(*autoYes, *mode, *connect)
+	runClient(*autoYes, *mode, *connect, *sysPrompt)
 }
 
 // =========================================================================
 // ACP Client
 // =========================================================================
 
-func runClient(autoYes bool, mode string, connectAddr string) {
+func runClient(autoYes bool, mode string, connectAddr string, sysPrompt string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer cancel()
 
@@ -87,12 +88,16 @@ func runClient(autoYes bool, mode string, connectAddr string) {
 	}
 	fmt.Printf("Connected (protocol v%v)\n\n", initResp.ProtocolVersion)
 
-	newSess, err := conn.NewSession(ctx, acp.NewSessionRequest{
+	sessReq := acp.NewSessionRequest{
 		Cwd: mustCwd(),
 		McpServers: []acp.McpServer{
 			{Stdio: &acp.McpServerStdio{Command: selfPath, Args: []string{"--mcp-server"}}},
 		},
-	})
+	}
+	if sysPrompt != "" {
+		sessReq.Meta = map[string]any{"system_prompt": sysPrompt}
+	}
+	newSess, err := conn.NewSession(ctx, sessReq)
 	if err != nil {
 		die("newSession", err)
 	}

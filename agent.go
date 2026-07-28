@@ -177,14 +177,14 @@ func (a *EinoAgent) getConn() *acp.AgentSideConnection {
 	return a.conn
 }
 
-func (a *EinoAgent) buildSessionAgent(tools []tool.BaseTool) (*adk.ChatModelAgent, error) {
+func (a *EinoAgent) buildSessionAgent(tools []tool.BaseTool, systemPrompt string) (*adk.ChatModelAgent, error) {
 	toolsConfig := adk.ToolsConfig{}
 	toolsConfig.Tools = tools
 
 	return adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:          "eino-agent",
 		Description:   "A general-purpose AI agent with filesystem and shell access",
-		Instruction:   a.cfg.SystemPrompt,
+		Instruction:   systemPrompt,
 		Model:         a.chatModel,
 		ToolsConfig:   toolsConfig,
 		MaxIterations: a.cfg.MaxIterations,
@@ -218,9 +218,15 @@ func (a *EinoAgent) Authenticate(ctx context.Context, params acp.AuthenticateReq
 func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	sid := randomID()
 
+	// System prompt: client can override via _meta.system_prompt
+	systemPrompt := a.cfg.SystemPrompt
+	if v, ok := params.Meta["system_prompt"].(string); ok && v != "" {
+		systemPrompt = v
+	}
+
 	var initMsgs []*schema.Message
-	if a.cfg.SystemPrompt != "" {
-		initMsgs = append(initMsgs, schema.SystemMessage(a.cfg.SystemPrompt))
+	if systemPrompt != "" {
+		initMsgs = append(initMsgs, schema.SystemMessage(systemPrompt))
 	}
 
 	s, err := a.sessions.Create(sid, initMsgs...)
@@ -231,7 +237,7 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 	mcpMgr := &Manager{}
 	mcpTools, _ := mcpMgr.Connect(ctx, params.McpServers)
 
-	cmAgent, err := a.buildSessionAgent(mcpTools)
+	cmAgent, err := a.buildSessionAgent(mcpTools, systemPrompt)
 	if err != nil {
 		mcpMgr.Close()
 		return acp.NewSessionResponse{}, fmt.Errorf("build agent: %w", err)

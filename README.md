@@ -81,7 +81,7 @@ EOF
 | `ACP_LLM_MODEL` | `llm_model` | 模型名称 | `gpt-4o` |
 | `ACP_LLM_BASE_URL` | `llm_base_url` | API 地址 | `https://api.openai.com/v1` |
 | `ACP_LLM_PROVIDER` | `llm_provider` | 提供商 | `openai-compatible` |
-| `ACP_SYSTEM_PROMPT` | `system_prompt` | 系统提示词 | 通用助手 |
+| `ACP_SYSTEM_PROMPT` | `system_prompt` | 默认系统提示词（可被 session 覆盖） | 通用助手 |
 | `ACP_DATA_DIR` | `data_dir` | 数据目录 | `~/.acp-agent` |
 | `ACP_DB_PATH` | `db_path` | SQLite 路径 | `$DATA_DIR/sessions.db` |
 | `ACP_LISTEN` | `listen` | 传输模式 | `stdio` |
@@ -106,7 +106,7 @@ EOF
 |------|------|------|
 | `initialize` | ✅ 完整 | 协议版本协商、能力声明（图片输入、session 加载、MCP over HTTP/SSE） |
 | `authenticate` | ✅ 通过 | 无认证，直接返回成功 |
-| `session/new` | ✅ 完整 | 创建 session，自动连接 MCP server 并发现工具 |
+| `session/new` | ✅ 完整 | 创建 session，自动连接 MCP server 发现工具，支持 `_meta.system_prompt` 动态注入提示词 |
 | `session/load` | ✅ 完整 | 从 SQLite 恢复 session |
 | `session/prompt` | ✅ 完整 | 流式输出（AgentMessageChunk）+ 思考内容（AgentThoughtChunk）+ 工具调用 + 权限控制 |
 | `session/cancel` | ✅ 完整 | 取消当前正在执行的 turn |
@@ -232,6 +232,12 @@ EOF
 go run ./examples/demo/ -y
 
 > 列出当前目录的文件                              # agent 模式下直接执行，LLM 自主调用工具
+```
+
+**注入自定义系统提示词**：
+
+```bash
+go run ./examples/demo/ -y --system-prompt "你是一个专业的 Go 代码审查员，只回答 Go 相关的问题。"
 ```
 
 **Plan 模式测试**：
