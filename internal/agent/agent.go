@@ -14,10 +14,12 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
 	"acp/internal/bridge"
 	"acp/internal/config"
+	"acp/internal/mcp"
 )
 
 // Ensure EinoAgent satisfies the required interfaces.
@@ -29,7 +31,6 @@ var (
 // EinoAgent implements acp.Agent, backed by eino's ChatModelAgent.
 type EinoAgent struct {
 	cfg       config.Config
-	cmAgent   *adk.ChatModelAgent
 	chatModel model.ToolCallingChatModel
 	sessions  *SessionManager
 	conn      *acp.AgentSideConnection
@@ -58,30 +59,20 @@ func (a *EinoAgent) getConn() *acp.AgentSideConnection {
 	return a.conn
 }
 
-// getOrCreateAgent returns the ChatModelAgent, creating it once on first use.
-func (a *EinoAgent) getOrCreateAgent() *adk.ChatModelAgent {
-	if a.cmAgent != nil {
-		return a.cmAgent
-	}
-
-	tools := bridge.BuildTools()
+// buildSessionAgent constructs a ChatModelAgent for a specific session,
+// combining base tools with MCP-discovered tools.
+func (a *EinoAgent) buildSessionAgent(tools []tool.BaseTool) (*adk.ChatModelAgent, error) {
 	toolsConfig := adk.ToolsConfig{}
 	toolsConfig.Tools = tools
 
-	cmAgent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+	return adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:          "eino-agent",
-		Description:   "A general-purpose AI agent with filesystem access",
+		Description:   "A general-purpose AI agent with filesystem and shell access",
 		Instruction:   a.cfg.SystemPrompt,
 		Model:         a.chatModel,
 		ToolsConfig:   toolsConfig,
 		MaxIterations: a.cfg.MaxIterations,
 	})
-	if err != nil {
-		panic(fmt.Sprintf("failed to create ChatModelAgent: %v", err))
-	}
-
-	a.cmAgent = cmAgent
-	return cmAgent
 }
 
 // --------------------------------------------------------------------------
@@ -114,16 +105,32 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 		initMsgs = append(initMsgs, schema.SystemMessage(a.cfg.SystemPrompt))
 	}
 
-	_, err := a.sessions.Create(sid, initMsgs...)
+	s, err := a.sessions.Create(sid, initMsgs...)
 	if err != nil {
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
+
+	// Connect MCP servers and discover tools
+	mcpMgr := &mcp.Manager{}
+	mcpTools, _ := mcpMgr.Connect(ctx, params.McpServers)
+
+	// Build session-specific agent: base tools + MCP tools
+	allTools := bridge.BuildTools()
+	allTools = append(allTools, mcpTools...)
+	cmAgent, err := a.buildSessionAgent(allTools)
+	if err != nil {
+		mcpMgr.Close()
+		return acp.NewSessionResponse{}, fmt.Errorf("build agent: %w", err)
+	}
+
+	s.SetMCAgent(cmAgent, mcpMgr)
 
 	return acp.NewSessionResponse{SessionId: acp.SessionId(sid)}, nil
 }
 
 func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	// If the session is not yet in memory, load it from the DB
+	// If the session is not yet in memory, load it from the DB.
+	// Note: MCP tools are NOT reconnected on load (they're ephemeral per original session creation).
 	if _, ok := a.sessions.Get(string(params.SessionId)); !ok {
 		_, err := a.sessions.Load(string(params.SessionId))
 		if err != nil {
@@ -170,8 +177,11 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 	// Build the full message list for this turn
 	messages := s.Messages()
 
-	// Get or create the ChatModelAgent
-	cmAgent := a.getOrCreateAgent()
+	// Get the session-specific agent
+	cmAgent := s.GetAgent()
+	if cmAgent == nil {
+		return acp.PromptResponse{}, fmt.Errorf("agent not initialized for session %s", sid)
+	}
 
 	// Create runner and execute
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
@@ -217,7 +227,11 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 }
 
 func (a *EinoAgent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	a.sessions.Delete(string(params.SessionId))
+	sid := string(params.SessionId)
+	if s, ok := a.sessions.Get(sid); ok {
+		s.CloseMCP()
+	}
+	a.sessions.Delete(sid)
 	return acp.CloseSessionResponse{}, nil
 }
 

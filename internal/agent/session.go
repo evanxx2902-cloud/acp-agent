@@ -4,7 +4,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
+
+	"acp/internal/mcp"
 )
 
 // Session holds per-session runtime state.
@@ -15,6 +18,12 @@ type Session struct {
 	messages []*schema.Message
 	cancel   context.CancelFunc
 	store    *Store
+
+	// MCP integration
+	mcpManager *mcp.Manager
+
+	// Per-session ChatModelAgent (may include MCP-discovered tools)
+	cmAgent *adk.ChatModelAgent
 }
 
 // AppendMessages appends messages and persists to the database.
@@ -22,7 +31,6 @@ func (s *Session) AppendMessages(msgs ...*schema.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.messages = append(s.messages, msgs...)
-	// Write-through: persist immediately
 	if s.store != nil {
 		_ = s.store.SaveMessages(s.ID, s.messages)
 	}
@@ -55,6 +63,32 @@ func (s *Session) Cancel() {
 	}
 }
 
+// SetMCAgent stores the per-session ChatModelAgent and MCP manager.
+func (s *Session) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *mcp.Manager) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cmAgent = cmAgent
+	s.mcpManager = mgr
+}
+
+// GetAgent returns the session's ChatModelAgent.
+func (s *Session) GetAgent() *adk.ChatModelAgent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cmAgent
+}
+
+// CloseMCP releases MCP connections for this session.
+func (s *Session) CloseMCP() {
+	s.mu.Lock()
+	mgr := s.mcpManager
+	s.mcpManager = nil
+	s.mu.Unlock()
+	if mgr != nil {
+		mgr.Close()
+	}
+}
+
 // SessionManager manages the in-memory session map backed by a SQLite Store.
 type SessionManager struct {
 	mu       sync.Mutex
@@ -82,7 +116,6 @@ func (sm *SessionManager) Create(id string, initialMessages ...*schema.Message) 
 		store:    sm.store,
 	}
 
-	// Persist initial messages
 	if len(initialMessages) > 0 {
 		_ = sm.store.SaveMessages(id, initialMessages)
 	}
