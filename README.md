@@ -153,6 +153,71 @@ acp/
 8. **工具调用**：当 LLM 决定调用工具时，通过 ACP 协议与客户端交互执行
 9. **返回结果**：推理完成后返回 `PromptResponse`，结束本轮对话
 
+## 测试
+
+acp-go-sdk 自带一个 ACP 客户端示例，可以直接用来验证 agent 是否正常工作。
+
+### 1. 准备工作
+
+```bash
+# 编译 agent
+cd /home/evan/acp
+go build -o agent-server ./cmd/agent-server/
+
+# 创建配置文件（包含 API Key，不要提交到 git）
+cat > config.json << 'EOF'
+{
+  "llm_api_key": "sk-你的key",
+  "llm_base_url": "https://api.deepseek.com/v1",
+  "llm_model": "deepseek-chat"
+}
+EOF
+```
+
+### 2. 运行测试
+
+```bash
+cd /home/evan/go/pkg/mod/github.com/coder/acp-go-sdk@v0.13.5/example/client/
+go run main.go /home/evan/acp/agent-server -config /home/evan/acp/config.json
+```
+
+客户端会自动启动 agent 作为子进程，通过 stdio 进行完整的 ACP 交互：
+
+1. `initialize` — 握手，协商协议版本
+2. `session/new` — 创建会话
+3. `session/prompt` — 发送 "Hello, agent!" 并接收流式回复
+4. 过程中如有工具调用、权限请求，客户端会打印并交互式处理
+
+### 3. 预期输出
+
+```
+✅ Connected to agent (protocol v1)
+📝 Created session: sess_xxxxxxxx
+💬 User: Hello, agent!
+
+ Hello! I'm an AI assistant with access to your filesystem...
+
+✅ Agent completed
+```
+
+- 看到 `✅ Connected` 说明 ACP 握手成功
+- 看到 LLM 的回复内容说明 eino 推理链路正常
+- 看到 `✅ Agent completed` 说明整个 turn 正常结束
+
+### 4. 测试工具调用（可选）
+
+把客户端代码里的 prompt 改成需要读文件的内容来验证工具调用。编辑 client 的 `main.go`：
+
+```go
+// 将
+Prompt: []acp.ContentBlock{acp.TextBlock("Hello, agent!")},
+
+// 改为
+Prompt: []acp.ContentBlock{acp.TextBlock("帮我读取 /home/evan/acp/README.md 的内容")},
+```
+
+重新运行测试，应该能看到 agent 调用 `acp_read_file` 工具读取文件内容。
+
 ## 许可
 
 Apache 2.0

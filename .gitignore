@@ -8,5 +8,8 @@
 *.swo
 *~
 
+# Config with secrets
+/config.json
+
 # OS
 .DS_Store
