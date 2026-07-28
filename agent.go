@@ -111,9 +111,8 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 	mcpMgr := &Manager{}
 	mcpTools, _ := mcpMgr.Connect(ctx, params.McpServers)
 
-	// Build session-specific agent: base tools + MCP tools
-	allTools := BuildTools()
-	allTools = append(allTools, mcpTools...)
+	// Build session-specific agent: all tools come from MCP
+	allTools := mcpTools
 	cmAgent, err := a.buildSessionAgent(allTools)
 	if err != nil {
 		mcpMgr.Close()
