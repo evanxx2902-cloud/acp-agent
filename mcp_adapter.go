@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
@@ -29,7 +34,6 @@ func NewToolAdapter(mcpTool mcpgo.Tool, client MCPCaller) (*ToolAdapter, error) 
 		Desc: mcpTool.Description,
 	}
 
-	// Convert MCP input schema to eino ParamsOneOf
 	if mcpTool.RawInputSchema != nil && len(mcpTool.RawInputSchema) > 0 {
 		var js jsonschema.Schema
 		if err := json.Unmarshal(mcpTool.RawInputSchema, &js); err != nil {
@@ -49,7 +53,7 @@ func (t *ToolAdapter) Info(ctx context.Context) (*schema.ToolInfo, error) {
 	return t.info, nil
 }
 
-// InvokableRun calls the MCP tool and returns the result as a string.
+// InvokableRun calls the MCP tool with ACP notifications and permission checks.
 func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
 	var args map[string]any
 	if argumentsInJSON != "" && argumentsInJSON != "{}" {
@@ -58,16 +62,110 @@ func (t *ToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON string, 
 		}
 	}
 
+	toolName := t.info.Name[5:] // strip "mcp__" prefix
+	conn, sid := getACPContext(ctx)
+	toolCallID := acp.ToolCallId("mcp_" + mcpShortID())
+	title := fmt.Sprintf("%s(%s)", toolName, summarizeArgs(args, 60))
+
+	// If ACP connection is available, notify the client and ask for permission
+	if conn != nil {
+		// Notify: tool call starting
+		if err := conn.SessionUpdate(ctx, acp.SessionNotification{
+			SessionId: sid,
+			Update: acp.StartToolCall(
+				toolCallID,
+				title,
+				acp.WithStartKind(acp.ToolKindOther),
+				acp.WithStartStatus(acp.ToolCallStatusPending),
+				acp.WithStartRawInput(args),
+			),
+		}); err != nil {
+			slog.Error("mcp tool start notification failed", "error", err)
+		}
+
+		// Ask permission
+		permResp, err := conn.RequestPermission(ctx, acp.RequestPermissionRequest{
+			SessionId: sid,
+			ToolCall: acp.ToolCallUpdate{
+				ToolCallId: toolCallID,
+				Title:      &title,
+				Kind:       acp.Ptr(acp.ToolKindOther),
+				Status:     acp.Ptr(acp.ToolCallStatusPending),
+				RawInput:   args,
+			},
+			Options: []acp.PermissionOption{
+				{Kind: acp.PermissionOptionKindAllowOnce, Name: "Allow", OptionId: acp.PermissionOptionId("allow")},
+				{Kind: acp.PermissionOptionKindRejectOnce, Name: "Reject", OptionId: acp.PermissionOptionId("reject")},
+			},
+		})
+		if err != nil {
+			slog.Error("permission request failed", "error", err)
+		} else if permResp.Outcome.Selected == nil {
+			// Cancelled
+			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
+				SessionId: sid,
+				Update: acp.UpdateToolCall(toolCallID,
+					acp.WithUpdateStatus(acp.ToolCallStatusFailed),
+					acp.WithUpdateTitle(title+" (cancelled)"),
+				),
+			})
+			return "cancelled by user", nil
+		} else if string(permResp.Outcome.Selected.OptionId) != "allow" {
+			// Rejected
+			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
+				SessionId: sid,
+				Update: acp.UpdateToolCall(toolCallID,
+					acp.WithUpdateStatus(acp.ToolCallStatusFailed),
+					acp.WithUpdateTitle(title+" (rejected)"),
+				),
+			})
+			return "rejected by user", nil
+		}
+
+		// Allowed — update status to in-progress
+		_ = conn.SessionUpdate(ctx, acp.SessionNotification{
+			SessionId: sid,
+			Update: acp.UpdateToolCall(toolCallID,
+				acp.WithUpdateStatus(acp.ToolCallStatusInProgress),
+			),
+		})
+	}
+
+	// Execute via MCP
 	result, err := t.client.CallTool(ctx, mcpgo.CallToolRequest{
 		Params: mcpgo.CallToolParams{
-			Name:      t.info.Name[5:], // strip "mcp__" prefix
+			Name:      toolName,
 			Arguments: args,
 		},
 	})
+
+	// Notify result
+	if conn != nil {
+		if err != nil {
+			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
+				SessionId: sid,
+				Update: acp.UpdateToolCall(toolCallID,
+					acp.WithUpdateStatus(acp.ToolCallStatusFailed),
+					acp.WithUpdateTitle(title+" (failed)"),
+				),
+			})
+		} else {
+			output := extractToolResult(result)
+			_ = conn.SessionUpdate(ctx, acp.SessionNotification{
+				SessionId: sid,
+				Update: acp.UpdateToolCall(toolCallID,
+					acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+					acp.WithUpdateTitle(title),
+					acp.WithUpdateContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(truncateText(output, 500)))}),
+					acp.WithUpdateRawOutput(map[string]any{"result": output}),
+				),
+			})
+		}
+	}
+
 	if err != nil {
 		return "", fmt.Errorf("mcp tool call failed: %w", err)
 	}
-
 	return extractToolResult(result), nil
 }
 
@@ -83,11 +181,11 @@ func extractToolResult(result *mcpgo.CallToolResult) string {
 		case mcpgo.TextContent:
 			texts = append(texts, c.Text)
 		case mcpgo.ImageContent:
-			texts = append(texts, fmt.Sprintf("[image: %s, mime: %s]", c.Data, c.MIMEType))
+			texts = append(texts, fmt.Sprintf("[image: %s]", c.MIMEType))
 		case mcpgo.EmbeddedResource:
-			texts = append(texts, fmt.Sprintf("[embedded resource: %+v]", c.Resource))
+			texts = append(texts, fmt.Sprintf("[embedded resource]"))
 		default:
-			texts = append(texts, fmt.Sprintf("[unknown content type: %T]", c))
+			texts = append(texts, fmt.Sprintf("[content: %T]", c))
 		}
 	}
 
@@ -116,4 +214,38 @@ func joinNonEmpty(ss []string, sep string) string {
 		result += sep + s
 	}
 	return result
+}
+
+func mcpShortID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "deadbeef"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func summarizeArgs(args map[string]any, maxLen int) string {
+	if len(args) == 0 {
+		return ""
+	}
+	var parts []string
+	for k, v := range args {
+		s := fmt.Sprintf("%v", v)
+		if len(s) > 40 {
+			s = s[:37] + "..."
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", k, s))
+	}
+	joined := strings.Join(parts, ", ")
+	if len(joined) > maxLen {
+		return joined[:maxLen-3] + "..."
+	}
+	return joined
+}
+
+func truncateText(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }

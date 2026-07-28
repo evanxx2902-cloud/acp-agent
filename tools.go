@@ -24,3 +24,10 @@ func ContextWithACP(ctx context.Context, conn *acp.AgentSideConnection, sessionI
 		SessionID: sessionID,
 	})
 }
+
+func getACPContext(ctx context.Context) (*acp.AgentSideConnection, acp.SessionId) {
+	if v, ok := ctx.Value(acpContextKey{}).(*acpContext); ok {
+		return v.Conn, v.SessionID
+	}
+	return nil, ""
+}

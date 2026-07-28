@@ -361,21 +361,60 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 			fmt.Printf("\n[thought] %s", text.Text.Text)
 		}
 	case u.ToolCall != nil:
-		fmt.Printf("\n[%s] %s\n", u.ToolCall.Status, u.ToolCall.Title)
+		kind := ""
+		if u.ToolCall.Kind != "" {
+			kind = fmt.Sprintf(" [%s]", string(u.ToolCall.Kind))
+		}
+		fmt.Printf("\n🔧 %s%s\n", u.ToolCall.Title, kind)
 	case u.ToolCallUpdate != nil:
 		status := "?"
 		if u.ToolCallUpdate.Status != nil {
 			status = string(*u.ToolCallUpdate.Status)
 		}
-		fmt.Printf("[tool: %s]\n", status)
+		switch status {
+		case "pending":
+			// already shown by ToolCall event
+		case "in_progress":
+			fmt.Print("  ⏳ running...")
+		case "completed":
+			fmt.Print("  ✅ done")
+		case "failed":
+			fmt.Print("  ❌ failed/rejected")
+		}
+		fmt.Println()
 	}
 	return nil
 }
 
 func (c *demoClient) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	// Auto-allow for demo
+	// Print what the tool wants to do
+	title := ""
+	if params.ToolCall.Title != nil {
+		title = *params.ToolCall.Title
+	}
+	fmt.Printf("\n┌─ Tool Permission ───────────────────┐\n")
+	fmt.Printf("│ %s\n", title)
+	if params.ToolCall.RawInput != nil {
+		b, _ := json.Marshal(params.ToolCall.RawInput)
+		fmt.Printf("│ args: %s\n", string(b))
+	}
+	fmt.Printf("└──────────────────────────────────────┘\n")
+
+	fmt.Print("Allow? [y/N] ")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(strings.ToLower(line))
+
+	if line == "y" || line == "yes" {
+		fmt.Println("✓ Allowed\n")
+		return acp.RequestPermissionResponse{
+			Outcome: acp.NewRequestPermissionOutcomeSelected("allow"),
+		}, nil
+	}
+
+	fmt.Println("✗ Rejected\n")
 	return acp.RequestPermissionResponse{
-		Outcome: acp.NewRequestPermissionOutcomeSelected("allow"),
+		Outcome: acp.NewRequestPermissionOutcomeSelected("reject"),
 	}, nil
 }
 
