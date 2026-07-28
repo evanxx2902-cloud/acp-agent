@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -80,11 +81,14 @@ func serveTCP(ctx context.Context, addr string, cfg Config, chatModel model.Tool
 
 	slog.Info("agent server listening (tcp)", "addr", addr, "version", acp.ProtocolVersionNumber)
 
+	var wg sync.WaitGroup
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
+				slog.Info("shutting down, waiting for active connections...")
+				wg.Wait()
 				return
 			default:
 				slog.Error("accept error", "error", err)
@@ -92,8 +96,10 @@ func serveTCP(ctx context.Context, addr string, cfg Config, chatModel model.Tool
 			}
 		}
 
+		wg.Add(1)
 		slog.Info("client connected", "remote", raw.RemoteAddr())
 		go func(c net.Conn) {
+			defer wg.Done()
 			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
 			conn := acp.NewAgentSideConnection(ag, c, c)
 			conn.SetLogger(logger)
@@ -121,11 +127,14 @@ func serveUnix(ctx context.Context, path string, cfg Config, chatModel model.Too
 
 	slog.Info("agent server listening (unix)", "path", path, "version", acp.ProtocolVersionNumber)
 
+	var wg sync.WaitGroup
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
+				slog.Info("shutting down, waiting for active connections...")
+				wg.Wait()
 				return
 			default:
 				slog.Error("accept error", "error", err)
@@ -133,8 +142,10 @@ func serveUnix(ctx context.Context, path string, cfg Config, chatModel model.Too
 			}
 		}
 
+		wg.Add(1)
 		slog.Info("client connected", "path", path)
 		go func(c net.Conn) {
+			defer wg.Done()
 			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
 			conn := acp.NewAgentSideConnection(ag, c, c)
 			conn.SetLogger(logger)
@@ -291,18 +302,22 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 		return a.createPlan(ctx, conn, s)
 	}
 
-	a.runReAct(ctx, conn, s)
+	if err := a.runReAct(ctx, conn, s); err != nil {
+		slog.Error("prompt execution failed", "error", err)
+		return acp.PromptResponse{}, err
+	}
 
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
 
 // runReAct runs the eino ReAct loop, streaming output to the ACP client.
-func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection, s *Session) {
+// Returns an error if the ReAct loop fails.
+func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection, s *Session) error {
 	messages := s.Messages()
 
 	cmAgent := s.GetAgent()
 	if cmAgent == nil {
-		return
+		return fmt.Errorf("agent not initialized")
 	}
 
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
@@ -319,8 +334,7 @@ func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection,
 			break
 		}
 		if event.Err != nil {
-			slog.Error("agent error", "error", event.Err)
-			break
+			return fmt.Errorf("agent error: %w", event.Err)
 		}
 		if event.Output != nil && event.Output.MessageOutput != nil {
 			if err := ProcessAgentEvent(ctx, conn, s.ID, event, &finalContent); err != nil {
@@ -333,6 +347,8 @@ func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection,
 	if responseText != "" {
 		s.AppendMessages(schema.AssistantMessage(responseText, nil))
 	}
+
+	return nil
 }
 
 // createPlan runs the LLM without tools to generate a structured plan.
@@ -540,12 +556,15 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 		s.ConsumeResume()
 		execMsg := schema.UserMessage("Execute the plan step by step. Use the available tools to accomplish each step.\n\nPlan to execute:\n" + planToText(plan))
 		s.AppendMessages(execMsg)
-		a.runReAct(ctx, conn, s)
+		if err := a.runReAct(ctx, conn, s); err != nil {
+			return acp.ResumeSessionResponse{}, err
+		}
 		sendPlanUpdate(ctx, conn, acp.SessionId(sid), plan)
 	} else {
-		// Generic resume: just continue the ReAct loop
 		s.ConsumeResume()
-		a.runReAct(ctx, conn, s)
+		if err := a.runReAct(ctx, conn, s); err != nil {
+			return acp.ResumeSessionResponse{}, err
+		}
 	}
 
 	return acp.ResumeSessionResponse{}, nil

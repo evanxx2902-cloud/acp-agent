@@ -113,6 +113,9 @@ func (s *Session) SetPlan(p *Plan) {
 	s.plan = p
 	s.resumePending = true
 	s.resumeReason = "plan_created"
+	if s.store != nil {
+		_ = s.store.SavePlan(s.ID, p)
+	}
 }
 
 func (s *Session) CanResume() bool {
@@ -125,6 +128,9 @@ func (s *Session) ConsumeResume() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resumePending = false
+	if s.store != nil {
+		_ = s.store.SavePlan(s.ID, nil) // clear plan from DB
+	}
 }
 
 func (s *Session) GetPlan() *Plan {
@@ -214,6 +220,13 @@ func (sm *SessionManager) Load(id string) (*Session, error) {
 		store:    sm.store,
 	}
 
+	// Restore plan if one was pending
+	if plan, err := sm.store.LoadPlan(id); err == nil && plan != nil {
+		s.plan = plan
+		s.resumePending = true
+		s.resumeReason = "plan_created"
+	}
+
 	sm.mu.Lock()
 	sm.sessions[id] = s
 	sm.mu.Unlock()
@@ -269,6 +282,7 @@ func NewStore(dbPath string) (*Store, error) {
 		CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
 			messages TEXT NOT NULL DEFAULT '[]',
+			plan TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)
@@ -276,6 +290,8 @@ func NewStore(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+	// Migration: add plan column to existing databases
+	db.Exec("ALTER TABLE sessions ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
 
 	return &Store{db: db}, nil
 }
@@ -352,4 +368,39 @@ func (s *Store) SaveMessages(id string, msgs []*schema.Message) error {
 		string(data), now, id,
 	)
 	return err
+}
+
+func (s *Store) SavePlan(id string, plan *Plan) error {
+	if plan == nil || len(plan.Entries) == 0 {
+		_, err := s.db.Exec("UPDATE sessions SET plan = '' WHERE id = ?", id)
+		return err
+	}
+	data, err := json.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("marshal plan: %w", err)
+	}
+	_, err = s.db.Exec("UPDATE sessions SET plan = ?, updated_at = ? WHERE id = ?",
+		string(data), time.Now().Unix(), id)
+	return err
+}
+
+func (s *Store) LoadPlan(id string) (*Plan, error) {
+	var raw string
+	if err := s.db.QueryRow("SELECT plan FROM sessions WHERE id = ?", id).Scan(&raw); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("session %s not found", id)
+		}
+		return nil, err
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	var plan Plan
+	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
+		return nil, fmt.Errorf("unmarshal plan: %w", err)
+	}
+	if len(plan.Entries) == 0 {
+		return nil, nil
+	}
+	return &plan, nil
 }
