@@ -126,9 +126,19 @@ func connectDB() *pgxpool.Pool {
 	}
 	pass := strings.TrimSpace(string(password))
 
-	// Connect via Unix socket at /tmp
-	connStr := fmt.Sprintf("host=/tmp user=pam password=%s dbname=postgres sslmode=disable", pass)
-	pool, err := pgxpool.New(context.Background(), connStr)
+	// Connect via Unix socket at /tmp, with a short timeout so MCP startup isn't blocked
+	connStr := fmt.Sprintf("host=/tmp user=pam password=%s dbname=postgres sslmode=disable connect_timeout=3", pass)
+	cfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "MCP server: invalid db config: %v (db tools disabled)\n", err)
+		return nil
+	}
+	cfg.MaxConns = 2
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server: failed to connect to DB: %v (db tools disabled)\n", err)
 		return nil
