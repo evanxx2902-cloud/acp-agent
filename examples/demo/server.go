@@ -26,4 +26,5 @@ func registerAllTools(s *server.MCPServer) {
 	registerFSTools(s)
 	registerTerminalTools(s)
 	registerPGTools(s)
+	registerCHTools(s)
 }
