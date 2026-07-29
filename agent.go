@@ -18,7 +18,10 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/adk/filesystem"
+	"github.com/cloudwego/eino/adk/middlewares/plantask"
 	"github.com/cloudwego/eino/adk/middlewares/summarization"
+	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -57,6 +60,9 @@ func main() {
 	}
 
 	sessionMgr := NewSessionManager(store)
+
+	// Global callbacks: trace component invocations
+	callbacks.AppendGlobalHandlers(newAgentCallback())
 
 	switch {
 	case strings.HasPrefix(cfg.Listen, "tcp://"):
@@ -197,6 +203,15 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, tools []tool.BaseTool
 		return nil, fmt.Errorf("create summarization: %w", err)
 	}
 
+	// Plan-task middleware: inject task management tools (TaskCreate/Get/Update/List)
+	planMW, err := plantask.New(ctx, &plantask.Config{
+		Backend: newTaskFS(),
+		BaseDir: "/tmp/acp-tasks",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create plantask: %w", err)
+	}
+
 	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:          "eino-agent",
 		Description:   "A general-purpose AI agent. Tools are provided by the client via MCP servers.",
@@ -204,7 +219,7 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, tools []tool.BaseTool
 		Model:         a.chatModel,
 		ToolsConfig:   toolsConfig,
 		MaxIterations: a.cfg.MaxIterations,
-		Handlers:      []adk.ChatModelAgentMiddleware{sumMW},
+		Handlers:      []adk.ChatModelAgentMiddleware{sumMW, planMW},
 	})
 }
 
@@ -800,6 +815,99 @@ func processNonStreaming(
 		slog.Debug("non-streaming tool result", "toolName", mv.ToolName, "content", msg.Content)
 	}
 	return nil
+}
+
+// =========================================================================
+// Task filesystem backend — minimal in-memory storage for plantask
+// =========================================================================
+
+type taskFS struct {
+	mu    sync.Mutex
+	files map[string]string // path → content
+}
+
+func newTaskFS() *taskFS {
+	return &taskFS{files: make(map[string]string)}
+}
+
+func (t *taskFS) LsInfo(ctx context.Context, req *plantask.LsInfoRequest) ([]plantask.FileInfo, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var out []plantask.FileInfo
+	for path := range t.files {
+		if path == req.Path || (strings.HasPrefix(path, req.Path+"/") && req.Path != "") {
+			out = append(out, plantask.FileInfo{Path: path, IsDir: false, Size: int64(len(t.files[path]))})
+		}
+	}
+	return out, nil
+}
+
+func (t *taskFS) Read(ctx context.Context, req *plantask.ReadRequest) (*filesystem.FileContent, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	content, ok := t.files[req.FilePath]
+	if !ok {
+		return nil, fmt.Errorf("file not found: %s", req.FilePath)
+	}
+	return &filesystem.FileContent{Content: content}, nil
+}
+
+func (t *taskFS) Write(ctx context.Context, req *plantask.WriteRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.files[req.FilePath] = req.Content
+	return nil
+}
+
+func (t *taskFS) Delete(ctx context.Context, req *plantask.DeleteRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	delete(t.files, req.FilePath)
+	return nil
+}
+
+// =========================================================================
+// Callbacks — observability hooks
+// =========================================================================
+
+type agentCallback struct {
+	callbacks.Handler
+}
+
+func newAgentCallback() callbacks.Handler {
+	return &agentCallback{}
+}
+
+func (c *agentCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+	slog.Debug("callback: start", "component", info.Component, "name", info.Name, "type", info.Type)
+	return ctx
+}
+
+func (c *agentCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+	slog.Debug("callback: end", "component", info.Component, "name", info.Name, "type", info.Type)
+	return ctx
+}
+
+func (c *agentCallback) OnError(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
+	slog.Warn("callback: error", "component", info.Component, "name", info.Name, "type", info.Type, "error", err)
+	return ctx
+}
+
+func (c *agentCallback) OnStartWithStreamInput(ctx context.Context, info *callbacks.RunInfo, input *schema.StreamReader[callbacks.CallbackInput]) context.Context {
+	return ctx
+}
+
+func (c *agentCallback) OnEndWithStreamOutput(ctx context.Context, info *callbacks.RunInfo, output *schema.StreamReader[callbacks.CallbackOutput]) context.Context {
+	return ctx
+}
+
+// Tell eino which timings we actually handle (avoids stream copying overhead)
+func (c *agentCallback) Needed(_ context.Context, _ *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
+	return timing == callbacks.TimingOnStart || timing == callbacks.TimingOnEnd || timing == callbacks.TimingOnError
 }
 
 // =========================================================================
