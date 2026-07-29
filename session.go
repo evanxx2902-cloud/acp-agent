@@ -27,9 +27,6 @@ type Session struct {
 	store    *Store
 	mode     string // "agent" (default) or "plan"
 
-	resumePending bool   // true when the session is waiting for ResumeSession
-	resumeReason  string // "plan_created", "tool_rejected", etc.
-
 	mcpManager *Manager
 	cmAgent    *adk.ChatModelAgent
 	dirty      bool // true if agent needs rebuild (mode or maxIter changed)
@@ -114,18 +111,6 @@ func (s *Session) IsDirty() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dirty
-}
-
-func (s *Session) CanResume() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.resumePending
-}
-
-func (s *Session) ConsumeResume() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.resumePending = false
 }
 
 func (s *Session) CloseMCP() {

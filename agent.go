@@ -479,11 +479,18 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 	sid := string(params.SessionId)
 	s, ok := a.sessions.Get(sid)
 	if !ok {
-		return acp.ResumeSessionResponse{}, fmt.Errorf("session %s not found", sid)
-	}
-
-	if !s.CanResume() {
-		return acp.ResumeSessionResponse{}, fmt.Errorf("session %s is not waiting for resume", sid)
+		// Try loading from DB if not in memory
+		var err error
+		s, err = a.sessions.Load(sid)
+		if err != nil {
+			return acp.ResumeSessionResponse{}, fmt.Errorf("session %s not found", sid)
+		}
+		// Rebuild agent for loaded session
+		cmAgent, err := a.buildSessionAgent(ctx, sid, nil, a.cfg.SystemPrompt, a.cfg.MaxIterations, s.GetMode())
+		if err != nil {
+			return acp.ResumeSessionResponse{}, fmt.Errorf("rebuild agent: %w", err)
+		}
+		s.SetMCAgent(cmAgent, nil)
 	}
 
 	conn := a.conn
@@ -493,7 +500,10 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 
 	ctx = ContextWithACP(ctx, conn, acp.SessionId(sid))
 
-	s.ConsumeResume()
+	// Send a continuation prompt so the LLM knows we're resuming
+	continueMsg := schema.UserMessage("(session resumed — continue where you left off)")
+	s.AppendMessages(continueMsg)
+
 	if err := a.runReAct(ctx, conn, s); err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
