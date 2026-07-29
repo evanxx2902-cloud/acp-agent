@@ -102,6 +102,7 @@ func runClient(autoYes bool, connectAddr string, sysPrompt string) {
 	fmt.Printf("Session: %s\n\n", newSess.SessionId)
 
 	reader := bufio.NewReader(os.Stdin)
+	turn := 0
 	for {
 		fmt.Print("> ")
 		line, err := reader.ReadString('\n')
@@ -109,22 +110,55 @@ func runClient(autoYes bool, connectAddr string, sysPrompt string) {
 			break
 		}
 		line = strings.TrimSpace(line)
-		if line == "" || line == "quit" || line == "exit" {
+		if line == "" {
+			continue
+		}
+		if line == "quit" || line == "exit" {
 			break
 		}
 
+		// Client-side commands
+		switch {
+		case line == "/help":
+			fmt.Print("\nCommands: /help  /tools  /quit\n")
+			fmt.Print("Multi-line: end a line with \\ to continue.\n\n")
+			continue
+		case line == "/tools":
+			fmt.Print("\nTools are provided by MCP servers — use the LLM to discover them.\n\n")
+			continue
+		}
+
+		// Multi-line input: trailing \ appends next line
+		for strings.HasSuffix(line, "\\") {
+			line = line[:len(line)-1] + "\n"
+			fmt.Print("  ")
+			next, _ := reader.ReadString('\n')
+			line += next
+		}
+
+		if turn > 0 {
+			fmt.Println("\n───")
+		}
 		fmt.Println()
+		turn++
+
 		_, err = conn.Prompt(ctx, acp.PromptRequest{
 			SessionId: newSess.SessionId,
 			Prompt:    []acp.ContentBlock{acp.TextBlock(line)},
 		})
 		if err != nil {
+			errMsg := fmt.Sprintf("%v", err)
 			if re, ok := err.(*acp.RequestError); ok {
-				b, _ := json.MarshalIndent(re, "", "  ")
-				fmt.Fprintf(os.Stderr, "Error: %s\n", string(b))
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				errMsg = re.Message
+				if re.Data != nil {
+					if s, ok := re.Data.(map[string]any); ok {
+						if e, ok := s["error"].(string); ok && e != "" {
+							errMsg = e
+						}
+					}
+				}
 			}
+			fmt.Fprintf(os.Stderr, "\n✗ %s\n", errMsg)
 		}
 		fmt.Println()
 	}
@@ -134,6 +168,7 @@ type demoClient struct {
 	autoYes       bool
 	thinkingStart time.Time
 	thinking      bool
+	lastToolTitle string // track current tool for result display
 }
 
 func (c *demoClient) clearThinking() {
@@ -157,7 +192,6 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 			c.thinking = true
 		}
 		elapsed := time.Since(c.thinkingStart).Round(time.Second)
-		// In-place refresh: \r goes to start of line, \033[K clears to end
 		fmt.Printf("\r\033[K  thinking ... (%v)", elapsed)
 	case u.ToolCall != nil:
 		c.clearThinking()
@@ -165,7 +199,30 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 		if u.ToolCall.Kind != "" {
 			kind = fmt.Sprintf(" [%s]", string(u.ToolCall.Kind))
 		}
-		fmt.Printf("\n🔧 %s%s\n", u.ToolCall.Title, kind)
+		c.lastToolTitle = u.ToolCall.Title
+		fmt.Printf("\n🔧 %s%s", u.ToolCall.Title, kind)
+	case u.ToolCallUpdate != nil:
+		status := "?"
+		if u.ToolCallUpdate.Status != nil {
+			status = string(*u.ToolCallUpdate.Status)
+		}
+		switch status {
+		case "pending":
+		case "in_progress":
+			fmt.Print(" ...")
+		case "completed":
+			fmt.Print(" ✓")
+			if ro, ok := u.ToolCallUpdate.RawOutput.(map[string]any); ok {
+				if s, _ := ro["result"].(string); s != "" {
+					fmt.Printf(" (%s)", summarizeLine(s, 60))
+				}
+			}
+		case "failed":
+			fmt.Print(" ✗")
+		}
+		if status != "pending" {
+			fmt.Println()
+		}
 	case u.Plan != nil:
 		c.clearThinking()
 		fmt.Println("\n📋 Plan:")
@@ -179,23 +236,20 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 			}
 			fmt.Printf("  %s %s\n", icon, entry.Content)
 		}
-	case u.ToolCallUpdate != nil:
-		status := "?"
-		if u.ToolCallUpdate.Status != nil {
-			status = string(*u.ToolCallUpdate.Status)
-		}
-		switch status {
-		case "pending":
-		case "in_progress":
-			fmt.Print("  ⏳ running...")
-		case "completed":
-			fmt.Print("  ✅ done")
-		case "failed":
-			fmt.Print("  ❌ failed/rejected")
-		}
-		fmt.Println()
 	}
 	return nil
+}
+
+func summarizeLine(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	// Take first line only
+	if idx := strings.Index(s, "\n"); idx >= 0 {
+		s = s[:idx]
+	}
+	if len(s) > maxLen {
+		s = s[:maxLen-1] + "…"
+	}
+	return s
 }
 
 func (c *demoClient) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
