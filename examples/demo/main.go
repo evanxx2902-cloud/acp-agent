@@ -197,39 +197,67 @@ type demoClient struct {
 	autoYes       bool
 	thinkingStart time.Time
 	thinking      bool
-	lastToolTitle string // track current tool for result display
+	thinkTicker   *time.Ticker
+	thinkDone     chan struct{}
 }
 
-func (c *demoClient) clearThinking() {
+func (c *demoClient) startThinking() {
 	if c.thinking {
-		fmt.Print("\r\033[K") // clear current line
-		c.thinking = false
+		return
 	}
+	c.thinking = true
+	c.thinkingStart = time.Now()
+	c.thinkDone = make(chan struct{})
+	c.thinkTicker = time.NewTicker(time.Second)
+	go func() {
+		for {
+			select {
+			case <-c.thinkTicker.C:
+				elapsed := time.Since(c.thinkingStart).Round(time.Second)
+				fmt.Printf("\r\033[K  thinking ... (%v)", elapsed)
+			case <-c.thinkDone:
+				c.thinkTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func (c *demoClient) stopThinking() {
+	if !c.thinking {
+		return
+	}
+	c.thinking = false
+	close(c.thinkDone)
+	fmt.Print("\r\033[K") // clear the thinking line
 }
 
 func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {
 	u := params.Update
 	switch {
 	case u.AgentMessageChunk != nil:
-		c.clearThinking()
+		c.stopThinking()
 		if t := u.AgentMessageChunk.Content; t.Text != nil {
 			fmt.Print(t.Text.Text)
 		}
 	case u.AgentThoughtChunk != nil:
-		if !c.thinking {
-			c.thinkingStart = time.Now()
-			c.thinking = true
-		}
-		elapsed := time.Since(c.thinkingStart).Round(time.Second)
-		fmt.Printf("\r\033[K  thinking ... (%v)", elapsed)
+		c.startThinking()
 	case u.ToolCall != nil:
-		c.clearThinking()
+		c.stopThinking()
 		kind := ""
 		if u.ToolCall.Kind != "" {
 			kind = fmt.Sprintf(" [%s]", string(u.ToolCall.Kind))
 		}
-		c.lastToolTitle = u.ToolCall.Title
+		// Main title line
 		fmt.Printf("\n🔧 %s%s", u.ToolCall.Title, kind)
+		// Arguments on separate indented line if available
+		if u.ToolCall.RawInput != nil {
+			argsStr := formatToolArgs(u.ToolCall.RawInput)
+			if argsStr != "" {
+				fmt.Printf("\n   %s", argsStr)
+			}
+		}
+		fmt.Println()
 	case u.ToolCallUpdate != nil:
 		status := "?"
 		if u.ToolCallUpdate.Status != nil {
@@ -238,22 +266,19 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 		switch status {
 		case "pending":
 		case "in_progress":
-			fmt.Print(" ...")
 		case "completed":
-			fmt.Print(" ✓")
+			fmt.Printf("  ✓ done")
 			if ro, ok := u.ToolCallUpdate.RawOutput.(map[string]any); ok {
 				if s, _ := ro["result"].(string); s != "" {
-					fmt.Printf(" (%s)", summarizeLine(s, 60))
+					fmt.Printf(" — %s", summarizeLine(s, 80))
 				}
 			}
-		case "failed":
-			fmt.Print(" ✗")
-		}
-		if status != "pending" {
 			fmt.Println()
+		case "failed":
+			fmt.Println("  ✗ failed")
 		}
 	case u.Plan != nil:
-		c.clearThinking()
+		c.stopThinking()
 		fmt.Println("\n📋 Plan:")
 		for _, entry := range u.Plan.Entries {
 			icon := "○"
@@ -267,6 +292,23 @@ func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotifi
 		}
 	}
 	return nil
+}
+
+func formatToolArgs(raw any) string {
+	m, ok := raw.(map[string]any)
+	if !ok || len(m) == 0 {
+		return ""
+	}
+	var parts []string
+	for k, v := range m {
+		s := fmt.Sprintf("%v", v)
+		// Show full content for single-line values, truncate multiline
+		if idx := strings.IndexByte(s, '\n'); idx > 0 {
+			s = s[:idx] + "…"
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", k, s))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func summarizeLine(s string, maxLen int) string {
