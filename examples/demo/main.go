@@ -139,11 +139,21 @@ func runClient(autoYes bool, connectAddr string, sysPrompt string, mode string, 
 		// Client-side commands
 		switch {
 		case line == "/help":
-			fmt.Print("\nCommands: /help  /tools  /quit\n")
+			fmt.Print("\nCommands: /help  /tools  /resume  /quit\n")
 			fmt.Print("Multi-line: end a line with \\ to continue.\n\n")
 			continue
 		case line == "/tools":
 			fmt.Print("\nTools are provided by MCP servers — use the LLM to discover them.\n\n")
+			continue
+		case line == "/resume":
+			fmt.Println()
+			_, err = conn.ResumeSession(ctx, acp.ResumeSessionRequest{
+				SessionId: newSess.SessionId,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\n✗ resume: %v\n", err)
+			}
+			fmt.Println()
 			continue
 		}
 
