@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -155,27 +156,43 @@ func runClient(autoYes bool, mode string, connectAddr string, sysPrompt string) 
 }
 
 type demoClient struct {
-	autoYes bool
+	autoYes       bool
+	thinkingStart time.Time
+	thinking      bool
+}
+
+func (c *demoClient) clearThinking() {
+	if c.thinking {
+		fmt.Print("\r\033[K") // clear current line
+		c.thinking = false
+	}
 }
 
 func (c *demoClient) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {
 	u := params.Update
 	switch {
 	case u.AgentMessageChunk != nil:
+		c.clearThinking()
 		if t := u.AgentMessageChunk.Content; t.Text != nil {
 			fmt.Print(t.Text.Text)
 		}
 	case u.AgentThoughtChunk != nil:
-		if t := u.AgentThoughtChunk.Content; t.Text != nil {
-			fmt.Printf("\n[thought] %s", t.Text.Text)
+		if !c.thinking {
+			c.thinkingStart = time.Now()
+			c.thinking = true
 		}
+		elapsed := time.Since(c.thinkingStart).Round(time.Second)
+		// In-place refresh: \r goes to start of line, \033[K clears to end
+		fmt.Printf("\r\033[K  thinking ... (%v)", elapsed)
 	case u.ToolCall != nil:
+		c.clearThinking()
 		kind := ""
 		if u.ToolCall.Kind != "" {
 			kind = fmt.Sprintf(" [%s]", string(u.ToolCall.Kind))
 		}
 		fmt.Printf("\n🔧 %s%s\n", u.ToolCall.Title, kind)
 	case u.Plan != nil:
+		c.clearThinking()
 		fmt.Println("\n📋 Plan:")
 		for _, entry := range u.Plan.Entries {
 			icon := "○"
