@@ -104,18 +104,18 @@ EOF
 
 | 方法 | 状态 | 说明 |
 |------|------|------|
-| `initialize` | ✅ 完整 | 协议版本协商、能力声明（图片输入、session 加载、MCP over HTTP/SSE） |
+| `initialize` | ✅ 完整 | 能力声明：图片输入、session 加载/关闭/列表/恢复、MCP over HTTP/SSE |
 | `authenticate` | ✅ 通过 | 无认证，直接返回成功 |
 | `session/new` | ✅ 完整 | 创建 session，自动连接 MCP server 发现工具，支持 `_meta.system_prompt` 动态注入提示词 |
-| `session/load` | ✅ 完整 | 从 SQLite 恢复 session |
+| `session/load` | ✅ 完整 | 从 SQLite 恢复 session，支持 `_meta.mcpServers` 重连 MCP |
 | `session/prompt` | ✅ 完整 | 流式输出（AgentMessageChunk）+ 思考内容（AgentThoughtChunk）+ 工具调用 + 权限控制 |
 | `session/cancel` | ✅ 完整 | 取消当前正在执行的 turn |
 | `session/close` | ✅ 完整 | 关闭 session，释放 MCP 连接，删除持久化数据 |
 | `session/list` | ✅ 完整 | 从 SQLite 查询所有 session |
-| `session/resume` | ✅ 完整 | plan 模式下，确认计划并恢复执行 |
+| `session/resume` | ✅ 完整 | plan 模式下确认计划并恢复执行，agent 模式下恢复被中断的 turn |
 | `session/set_mode` | ✅ 完整 | 支持 `agent` 模式（默认）和 `plan` 模式 |
 | `session/set_config_option` | ⚠️ 接受 | 接受但不生效，预留扩展点 |
-| `logout` | ❌ 未实现 | 无认证机制，不需要登出 |
+| `logout` | ✅ 通过 | 无认证机制，直接返回成功 |
 
 ### 通知（Agent → Client）
 

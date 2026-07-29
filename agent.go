@@ -210,6 +210,11 @@ func (a *EinoAgent) Initialize(ctx context.Context, params acp.InitializeRequest
 				Audio:           false,
 				EmbeddedContext: false,
 			},
+			SessionCapabilities: acp.SessionCapabilities{
+				Close:  &acp.SessionCloseCapabilities{},
+				List:   &acp.SessionListCapabilities{},
+				Resume: &acp.SessionResumeCapabilities{},
+			},
 		},
 	}, nil
 }
@@ -595,7 +600,8 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 }
 
 func (a *EinoAgent) Logout(ctx context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
-	return acp.LogoutResponse{}, acp.NewMethodNotFound(acp.AgentMethodLogout)
+	// No-op: we don't have authentication, so nothing to revoke
+	return acp.LogoutResponse{}, nil
 }
 
 // =========================================================================
