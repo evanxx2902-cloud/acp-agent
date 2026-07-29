@@ -18,6 +18,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/adk/middlewares/summarization"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -184,6 +185,18 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, tools []tool.BaseTool
 	toolsConfig := adk.ToolsConfig{}
 	toolsConfig.Tools = tools
 
+	// Summarization middleware: compress history when context grows too large
+	sumMW, err := summarization.New(ctx, &summarization.Config{
+		Model: a.chatModel,
+		Trigger: &summarization.TriggerCondition{
+			ContextTokens:   32000,
+			ContextMessages: 100,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create summarization: %w", err)
+	}
+
 	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:          "eino-agent",
 		Description:   "A general-purpose AI agent. Tools are provided by the client via MCP servers.",
@@ -191,6 +204,7 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, tools []tool.BaseTool
 		Model:         a.chatModel,
 		ToolsConfig:   toolsConfig,
 		MaxIterations: a.cfg.MaxIterations,
+		Handlers:      []adk.ChatModelAgentMiddleware{sumMW},
 	})
 }
 
