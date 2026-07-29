@@ -32,6 +32,7 @@ type Session struct {
 
 	mcpManager *Manager
 	cmAgent    *adk.ChatModelAgent
+	dirty      bool // true if agent needs rebuild (mode or maxIter changed)
 }
 
 func (s *Session) AppendMessages(msgs ...*schema.Message) {
@@ -72,12 +73,47 @@ func (s *Session) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *Manager) {
 	defer s.mu.Unlock()
 	s.cmAgent = cmAgent
 	s.mcpManager = mgr
+	s.dirty = false
+}
+
+func (s *Session) RebuildAgent(cmAgent *adk.ChatModelAgent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cmAgent = cmAgent
+	s.dirty = false
 }
 
 func (s *Session) GetAgent() *adk.ChatModelAgent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cmAgent
+}
+
+func (s *Session) SetMode(mode string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mode = mode
+}
+
+func (s *Session) GetMode() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mode == "" {
+		return "agent"
+	}
+	return s.mode
+}
+
+func (s *Session) SetDirty() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dirty = true
+}
+
+func (s *Session) IsDirty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dirty
 }
 
 func (s *Session) CanResume() bool {

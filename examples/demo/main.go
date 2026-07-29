@@ -24,15 +24,17 @@ func main() {
 	autoYes := flag.Bool("y", false, "Auto-approve all tool permissions")
 	connect := flag.String("connect", "", "Connect to running agent: tcp://host:port or unix:///path/to/sock")
 	sysPrompt := flag.String("system-prompt", "", "Override system prompt for the session")
+	mode := flag.String("mode", "agent", "Session mode: 'agent' or 'plan'")
+	maxIter := flag.Int("max-iter", 0, "Override max ReAct iterations (0=use default)")
 	flag.Parse()
-	runClient(*autoYes, *connect, *sysPrompt)
+	runClient(*autoYes, *connect, *sysPrompt, *mode, *maxIter)
 }
 
 // =========================================================================
 // ACP Client
 // =========================================================================
 
-func runClient(autoYes bool, connectAddr string, sysPrompt string) {
+func runClient(autoYes bool, connectAddr string, sysPrompt string, mode string, maxIter int) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer cancel()
 
@@ -41,6 +43,9 @@ func runClient(autoYes bool, connectAddr string, sysPrompt string) {
 	fmt.Print("=== ACP Agent Demo ===\n\n")
 	if autoYes {
 		fmt.Println("Auto-yes: enabled")
+	}
+	if maxIter > 0 {
+		fmt.Printf("Max-iter: %d\n", maxIter)
 	}
 	client := &demoClient{autoYes: autoYes}
 
@@ -92,14 +97,28 @@ func runClient(autoYes bool, connectAddr string, sysPrompt string) {
 			{Stdio: &acp.McpServerStdio{Command: selfPath, Args: []string{"--mcp-server"}}},
 		},
 	}
-	if sysPrompt != "" {
-		sessReq.Meta = map[string]any{"system_prompt": sysPrompt}
+	if sysPrompt != "" || maxIter > 0 {
+		sessReq.Meta = make(map[string]any)
+		if sysPrompt != "" {
+			sessReq.Meta["system_prompt"] = sysPrompt
+		}
+		if maxIter > 0 {
+			sessReq.Meta["max_iterations"] = float64(maxIter)
+		}
 	}
 	newSess, err := conn.NewSession(ctx, sessReq)
 	if err != nil {
 		die("newSession", err)
 	}
-	fmt.Printf("Session: %s\n\n", newSess.SessionId)
+	fmt.Printf("Session: %s\n", newSess.SessionId)
+	if mode == "plan" {
+		conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
+			SessionId: newSess.SessionId,
+			ModeId:    acp.SessionModeId(mode),
+		})
+		fmt.Printf("Mode:     plan\n")
+	}
+	fmt.Println()
 
 	reader := bufio.NewReader(os.Stdin)
 	turn := 0

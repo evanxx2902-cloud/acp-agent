@@ -188,7 +188,7 @@ type EinoAgent struct {
 	conn      *acp.AgentSideConnection // per-connection, nil if not set
 }
 
-func (a *EinoAgent) buildSessionAgent(ctx context.Context, sessionID string, tools []tool.BaseTool, systemPrompt string) (*adk.ChatModelAgent, error) {
+func (a *EinoAgent) buildSessionAgent(ctx context.Context, sessionID string, tools []tool.BaseTool, systemPrompt string, maxIterations int, modeHint string) (*adk.ChatModelAgent, error) {
 	toolsConfig := adk.ToolsConfig{}
 	toolsConfig.Tools = tools
 
@@ -214,13 +214,22 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, sessionID string, too
 		return nil, fmt.Errorf("create plantask: %w", err)
 	}
 
+	// Mode hint: inject plan-oriented prefix if in plan mode
+	instruction := systemPrompt
+	if modeHint == "plan" {
+		instruction = "You are in PLANNING mode. " +
+			"Before executing any tools, first use TaskCreate to break the user's request into clear steps. " +
+			"Present the complete plan to the user. " +
+			"Only begin executing when the user explicitly confirms to proceed.\n\n" + instruction
+	}
+
 	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:          "eino-agent",
 		Description:   "A general-purpose AI agent. Tools are provided by the client via MCP servers.",
-		Instruction:   systemPrompt,
+		Instruction:   instruction,
 		Model:         a.chatModel,
 		ToolsConfig:   toolsConfig,
-		MaxIterations: a.cfg.MaxIterations,
+		MaxIterations: maxIterations,
 		Handlers:      []adk.ChatModelAgentMiddleware{sumMW, planMW},
 	})
 }
@@ -263,6 +272,12 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 		systemPrompt = v
 	}
 
+	// Max iterations: client can override via _meta.max_iterations
+	maxIterations := a.cfg.MaxIterations
+	if v, ok := params.Meta["max_iterations"].(float64); ok && v > 0 {
+		maxIterations = int(v)
+	}
+
 	var initMsgs []*schema.Message
 	if systemPrompt != "" {
 		initMsgs = append(initMsgs, schema.SystemMessage(systemPrompt))
@@ -279,7 +294,7 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 		slog.Warn("some MCP servers failed to connect", "error", mcpErr)
 	}
 
-	cmAgent, err := a.buildSessionAgent(ctx, sid, mcpTools, systemPrompt)
+	cmAgent, err := a.buildSessionAgent(ctx, sid, mcpTools, systemPrompt, maxIterations, "")
 	if err != nil {
 		mcpMgr.Close()
 		return acp.NewSessionResponse{}, fmt.Errorf("build agent: %w", err)
@@ -314,7 +329,7 @@ func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionReque
 		}
 	}
 
-	cmAgent, err := a.buildSessionAgent(ctx, sid, mcpTools, a.cfg.SystemPrompt)
+	cmAgent, err := a.buildSessionAgent(ctx, sid, mcpTools, a.cfg.SystemPrompt, a.cfg.MaxIterations, "")
 	if err != nil {
 		if mcpMgr != nil {
 			mcpMgr.Close()
@@ -356,6 +371,16 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 
 	userMsg := ContentBlocksToMessage(params.Prompt)
 	s.AppendMessages(userMsg)
+
+	// Rebuild agent lazily if mode or maxIter changed (preserves MCP manager)
+	if s.IsDirty() {
+		cmAgent, err := a.buildSessionAgent(ctx, sid, nil, a.cfg.SystemPrompt, a.cfg.MaxIterations, s.GetMode())
+		if err != nil {
+			slog.Error("failed to rebuild agent", "error", err)
+		} else {
+			s.RebuildAgent(cmAgent)
+		}
+	}
 
 	if err := a.runReAct(ctx, conn, s); err != nil {
 		slog.Error("prompt execution failed", "error", err)
@@ -438,7 +463,15 @@ func (a *EinoAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSe
 }
 
 func (a *EinoAgent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
-	// No-op: all sessions run in agent mode. Plan/task management is handled by plantask middleware.
+	sid := string(params.SessionId)
+	s, ok := a.sessions.Get(sid)
+	if !ok {
+		return acp.SetSessionModeResponse{}, fmt.Errorf("session %s not found", sid)
+	}
+	mode := string(params.ModeId)
+	s.SetMode(mode)
+	s.SetDirty() // trigger agent rebuild on next Prompt
+	slog.Info("session mode set", "session", sid, "mode", mode)
 	return acp.SetSessionModeResponse{}, nil
 }
 
