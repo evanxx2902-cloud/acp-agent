@@ -22,18 +22,17 @@ func main() {
 	}
 
 	autoYes := flag.Bool("y", false, "Auto-approve all tool permissions")
-	mode := flag.String("mode", "agent", "Session mode: 'agent' or 'plan'")
 	connect := flag.String("connect", "", "Connect to running agent: tcp://host:port or unix:///path/to/sock")
 	sysPrompt := flag.String("system-prompt", "", "Override system prompt for the session")
 	flag.Parse()
-	runClient(*autoYes, *mode, *connect, *sysPrompt)
+	runClient(*autoYes, *connect, *sysPrompt)
 }
 
 // =========================================================================
 // ACP Client
 // =========================================================================
 
-func runClient(autoYes bool, mode string, connectAddr string, sysPrompt string) {
+func runClient(autoYes bool, connectAddr string, sysPrompt string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer cancel()
 
@@ -43,8 +42,6 @@ func runClient(autoYes bool, mode string, connectAddr string, sysPrompt string) 
 	if autoYes {
 		fmt.Println("Auto-yes: enabled")
 	}
-	fmt.Printf("Mode:     %s\n\n", mode)
-
 	client := &demoClient{autoYes: autoYes}
 
 	var conn *acp.ClientSideConnection
@@ -104,20 +101,9 @@ func runClient(autoYes bool, mode string, connectAddr string, sysPrompt string) 
 	}
 	fmt.Printf("Session: %s\n\n", newSess.SessionId)
 
-	if mode != "agent" {
-		conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
-			SessionId: newSess.SessionId,
-			ModeId:    acp.SessionModeId(mode),
-		})
-	}
-
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		if mode == "plan" {
-			fmt.Print("[plan] > ")
-		} else {
-			fmt.Print("> ")
-		}
+		fmt.Print("> ")
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
@@ -128,17 +114,6 @@ func runClient(autoYes bool, mode string, connectAddr string, sysPrompt string) 
 		}
 
 		fmt.Println()
-		if mode == "plan" && (line == "g" || line == "go") {
-			_, err = conn.ResumeSession(ctx, acp.ResumeSessionRequest{
-				SessionId: newSess.SessionId,
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "resume error: %v\n", err)
-			}
-			fmt.Println()
-			continue
-		}
-
 		_, err = conn.Prompt(ctx, acp.PromptRequest{
 			SessionId: newSess.SessionId,
 			Prompt:    []acp.ContentBlock{acp.TextBlock(line)},

@@ -32,18 +32,6 @@ type Session struct {
 
 	mcpManager *Manager
 	cmAgent    *adk.ChatModelAgent
-	plan       *Plan // pending plan for plan mode
-}
-
-// Plan holds a plan created by the LLM in plan mode.
-type Plan struct {
-	Entries []PlanEntry `json:"entries"`
-}
-
-// PlanEntry is a single step in the plan.
-type PlanEntry struct {
-	Description string `json:"description"`
-	Status      string `json:"status"` // "pending", "in_progress", "completed"
 }
 
 func (s *Session) AppendMessages(msgs ...*schema.Message) {
@@ -92,32 +80,6 @@ func (s *Session) GetAgent() *adk.ChatModelAgent {
 	return s.cmAgent
 }
 
-func (s *Session) SetMode(mode string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mode = mode
-}
-
-func (s *Session) GetMode() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.mode == "" {
-		return "agent"
-	}
-	return s.mode
-}
-
-func (s *Session) SetPlan(p *Plan) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.plan = p
-	s.resumePending = true
-	s.resumeReason = "plan_created"
-	if s.store != nil {
-		_ = s.store.SavePlan(s.ID, p)
-	}
-}
-
 func (s *Session) CanResume() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -128,29 +90,6 @@ func (s *Session) ConsumeResume() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resumePending = false
-	if s.store != nil {
-		_ = s.store.SavePlan(s.ID, nil) // clear plan from DB
-	}
-}
-
-func (s *Session) GetPlan() *Plan {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.plan == nil {
-		return nil
-	}
-	cp := *s.plan
-	cp.Entries = make([]PlanEntry, len(s.plan.Entries))
-	copy(cp.Entries, s.plan.Entries)
-	return &cp
-}
-
-func (s *Session) UpdatePlanStatus(idx int, status string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.plan != nil && idx >= 0 && idx < len(s.plan.Entries) {
-		s.plan.Entries[idx].Status = status
-	}
 }
 
 func (s *Session) CloseMCP() {
@@ -220,13 +159,6 @@ func (sm *SessionManager) Load(id string) (*Session, error) {
 		store:    sm.store,
 	}
 
-	// Restore plan if one was pending
-	if plan, err := sm.store.LoadPlan(id); err == nil && plan != nil {
-		s.plan = plan
-		s.resumePending = true
-		s.resumeReason = "plan_created"
-	}
-
 	sm.mu.Lock()
 	sm.sessions[id] = s
 	sm.mu.Unlock()
@@ -282,7 +214,7 @@ func NewStore(dbPath string) (*Store, error) {
 		CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
 			messages TEXT NOT NULL DEFAULT '[]',
-			plan TEXT NOT NULL DEFAULT '',
+			tasks TEXT NOT NULL DEFAULT '{}',
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)
@@ -290,8 +222,8 @@ func NewStore(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
-	// Migration: add plan column to existing databases
-	db.Exec("ALTER TABLE sessions ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
+	// Migration: add tasks column to existing databases
+	db.Exec("ALTER TABLE sessions ADD COLUMN tasks TEXT NOT NULL DEFAULT '{}'")
 
 	return &Store{db: db}, nil
 }
@@ -301,7 +233,7 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) CreateSession(id string) error {
 	now := time.Now().Unix()
 	_, err := s.db.Exec(
-		"INSERT INTO sessions (id, messages, created_at, updated_at) VALUES (?, '[]', ?, ?)",
+		"INSERT INTO sessions (id, messages, tasks, created_at, updated_at) VALUES (?, '[]', '{}', ?, ?)",
 		id, now, now,
 	)
 	return err
@@ -370,37 +302,31 @@ func (s *Store) SaveMessages(id string, msgs []*schema.Message) error {
 	return err
 }
 
-func (s *Store) SavePlan(id string, plan *Plan) error {
-	if plan == nil || len(plan.Entries) == 0 {
-		_, err := s.db.Exec("UPDATE sessions SET plan = '' WHERE id = ?", id)
-		return err
-	}
-	data, err := json.Marshal(plan)
+func (s *Store) SaveTasks(id string, tasks map[string]string) error {
+	data, err := json.Marshal(tasks)
 	if err != nil {
-		return fmt.Errorf("marshal plan: %w", err)
+		return fmt.Errorf("marshal tasks: %w", err)
 	}
-	_, err = s.db.Exec("UPDATE sessions SET plan = ?, updated_at = ? WHERE id = ?",
+	_, err = s.db.Exec("UPDATE sessions SET tasks = ?, updated_at = ? WHERE id = ?",
 		string(data), time.Now().Unix(), id)
 	return err
 }
 
-func (s *Store) LoadPlan(id string) (*Plan, error) {
+func (s *Store) LoadTasks(id string) (map[string]string, error) {
 	var raw string
-	if err := s.db.QueryRow("SELECT plan FROM sessions WHERE id = ?", id).Scan(&raw); err != nil {
+	if err := s.db.QueryRow("SELECT tasks FROM sessions WHERE id = ?", id).Scan(&raw); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("session %s not found", id)
 		}
 		return nil, err
 	}
-	if raw == "" {
+	if raw == "" || raw == "{}" {
 		return nil, nil
 	}
-	var plan Plan
-	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
-		return nil, fmt.Errorf("unmarshal plan: %w", err)
+	var tasks map[string]string
+	if err := json.Unmarshal([]byte(raw), &tasks); err != nil {
+		return nil, fmt.Errorf("unmarshal tasks: %w", err)
 	}
-	if len(plan.Entries) == 0 {
-		return nil, nil
-	}
-	return &plan, nil
+	return tasks, nil
 }
+

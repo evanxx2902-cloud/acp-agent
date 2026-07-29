@@ -67,17 +67,17 @@ func main() {
 	switch {
 	case strings.HasPrefix(cfg.Listen, "tcp://"):
 		addr := strings.TrimPrefix(cfg.Listen, "tcp://")
-		serveTCP(ctx, addr, cfg, chatModel, sessionMgr, logger)
+		serveTCP(ctx, addr, cfg, chatModel, sessionMgr, store, logger)
 	case strings.HasPrefix(cfg.Listen, "unix://"):
 		path := strings.TrimPrefix(cfg.Listen, "unix://")
-		serveUnix(ctx, path, cfg, chatModel, sessionMgr, logger)
+		serveUnix(ctx, path, cfg, chatModel, sessionMgr, store, logger)
 	default:
-		serveStdio(cfg, chatModel, sessionMgr, logger)
+		serveStdio(cfg, chatModel, sessionMgr, store, logger)
 	}
 }
 
-func serveStdio(cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, logger *slog.Logger) {
-	ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
+func serveStdio(cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, store *Store, logger *slog.Logger) {
+	ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr, store: store}
 	conn := acp.NewAgentSideConnection(ag, os.Stdout, os.Stdin)
 	conn.SetLogger(logger)
 	ag.conn = conn
@@ -87,7 +87,7 @@ func serveStdio(cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *Se
 	slog.Info("agent server shutting down")
 }
 
-func serveTCP(ctx context.Context, addr string, cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, logger *slog.Logger) {
+func serveTCP(ctx context.Context, addr string, cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, store *Store, logger *slog.Logger) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		slog.Error("failed to listen", "addr", addr, "error", err)
@@ -116,7 +116,7 @@ func serveTCP(ctx context.Context, addr string, cfg Config, chatModel model.Tool
 		slog.Info("client connected", "remote", raw.RemoteAddr())
 		go func(c net.Conn) {
 			defer wg.Done()
-			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
+			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr, store: store}
 			conn := acp.NewAgentSideConnection(ag, c, c)
 			conn.SetLogger(logger)
 			ag.conn = conn
@@ -125,7 +125,7 @@ func serveTCP(ctx context.Context, addr string, cfg Config, chatModel model.Tool
 	}
 }
 
-func serveUnix(ctx context.Context, path string, cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, logger *slog.Logger) {
+func serveUnix(ctx context.Context, path string, cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, store *Store, logger *slog.Logger) {
 	_ = os.Remove(path)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -162,7 +162,7 @@ func serveUnix(ctx context.Context, path string, cfg Config, chatModel model.Too
 		slog.Info("client connected", "path", path)
 		go func(c net.Conn) {
 			defer wg.Done()
-			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr}
+			ag := &EinoAgent{cfg: cfg, chatModel: chatModel, sessions: sessionMgr, store: store}
 			conn := acp.NewAgentSideConnection(ag, c, c)
 			conn.SetLogger(logger)
 			ag.conn = conn
@@ -184,10 +184,11 @@ type EinoAgent struct {
 	cfg       Config
 	chatModel model.ToolCallingChatModel
 	sessions  *SessionManager
+	store     *Store
 	conn      *acp.AgentSideConnection // per-connection, nil if not set
 }
 
-func (a *EinoAgent) buildSessionAgent(ctx context.Context, tools []tool.BaseTool, systemPrompt string) (*adk.ChatModelAgent, error) {
+func (a *EinoAgent) buildSessionAgent(ctx context.Context, sessionID string, tools []tool.BaseTool, systemPrompt string) (*adk.ChatModelAgent, error) {
 	toolsConfig := adk.ToolsConfig{}
 	toolsConfig.Tools = tools
 
@@ -203,10 +204,11 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, tools []tool.BaseTool
 		return nil, fmt.Errorf("create summarization: %w", err)
 	}
 
-	// Plan-task middleware: inject task management tools (TaskCreate/Get/Update/List)
+	// Plan-task middleware: inject task management tools, persisted to SQLite
+	taskBackend := newStoreTaskFS(a.store, sessionID)
 	planMW, err := plantask.New(ctx, &plantask.Config{
-		Backend: newTaskFS(),
-		BaseDir: "/tmp/acp-tasks",
+		Backend: taskBackend,
+		BaseDir: "/tasks",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create plantask: %w", err)
@@ -277,7 +279,7 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 		slog.Warn("some MCP servers failed to connect", "error", mcpErr)
 	}
 
-	cmAgent, err := a.buildSessionAgent(ctx, mcpTools, systemPrompt)
+	cmAgent, err := a.buildSessionAgent(ctx, sid, mcpTools, systemPrompt)
 	if err != nil {
 		mcpMgr.Close()
 		return acp.NewSessionResponse{}, fmt.Errorf("build agent: %w", err)
@@ -312,7 +314,7 @@ func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionReque
 		}
 	}
 
-	cmAgent, err := a.buildSessionAgent(ctx, mcpTools, a.cfg.SystemPrompt)
+	cmAgent, err := a.buildSessionAgent(ctx, sid, mcpTools, a.cfg.SystemPrompt)
 	if err != nil {
 		if mcpMgr != nil {
 			mcpMgr.Close()
@@ -354,11 +356,6 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 
 	userMsg := ContentBlocksToMessage(params.Prompt)
 	s.AppendMessages(userMsg)
-
-	// Plan mode: create plan first, then wait for ResumeSession to execute
-	if s.GetMode() == "plan" && s.GetPlan() == nil {
-		return a.createPlan(ctx, conn, s)
-	}
 
 	if err := a.runReAct(ctx, conn, s); err != nil {
 		slog.Error("prompt execution failed", "error", err)
@@ -409,145 +406,6 @@ func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection,
 	return nil
 }
 
-// createPlan runs the LLM without tools to generate a structured plan.
-func (a *EinoAgent) createPlan(ctx context.Context, conn *acp.AgentSideConnection, s *Session) (acp.PromptResponse, error) {
-	// Build a plan-only agent (no tools)
-	planAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "plan-agent",
-		Description: "Creates step-by-step execution plans",
-		Instruction: a.cfg.SystemPrompt + "\n\n" +
-			"You are in PLANNING mode. Do NOT execute any tools or commands. " +
-			"Instead, analyze the user's request and create a detailed, step-by-step plan. " +
-			"Output your plan in JSON format as an array of steps. " +
-			"Each step must have: \"description\" (what to do) and \"tool\" (which tool to use). " +
-			"Example: [{\"description\":\"Read the project README\",\"tool\":\"read_file\"}]. " +
-			"Output ONLY the JSON array, no other text.",
-		Model:         a.chatModel,
-		ToolsConfig:   adk.ToolsConfig{}, // empty — no tools
-		MaxIterations: 1,
-	})
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
-
-	messages := s.Messages()
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{
-		Agent:           planAgent,
-		EnableStreaming: false,
-	})
-
-	iter := runner.Run(ctx, messages)
-
-	var planText strings.Builder
-	for {
-		event, ok := iter.Next()
-		if !ok {
-			break
-		}
-		if event.Err != nil {
-			slog.Error("plan creation error", "error", event.Err)
-			break
-		}
-		if event.Output != nil && event.Output.MessageOutput != nil {
-			msg := event.Output.MessageOutput.Message
-			if msg != nil && msg.Content != "" {
-				planText.WriteString(msg.Content)
-			}
-		}
-	}
-
-	plan := parsePlanFromText(planText.String())
-	if len(plan.Entries) == 0 {
-		// Fallback: single-step plan
-		plan.Entries = []PlanEntry{{Description: planText.String(), Status: "pending"}}
-	}
-
-	s.SetPlan(plan)
-	sendPlanUpdate(ctx, conn, acp.SessionId(s.ID), plan)
-
-	// Tell user the plan was created
-	_ = conn.SessionUpdate(ctx, acp.SessionNotification{
-		SessionId: acp.SessionId(s.ID),
-		Update:    acp.UpdateAgentMessageText("Plan created with " + itoa(len(plan.Entries)) + " steps. Review and confirm to execute."),
-	})
-
-	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
-}
-
-// =========================================================================
-// Plan helpers
-// =========================================================================
-
-func parsePlanFromText(text string) *Plan {
-	text = strings.TrimSpace(text)
-
-	// Try JSON array first
-	text = extractJSON(text)
-	var entries []PlanEntry
-	if err := json.Unmarshal([]byte(text), &entries); err == nil && len(entries) > 0 {
-		for i := range entries {
-			entries[i].Status = "pending"
-		}
-		return &Plan{Entries: entries}
-	}
-
-	// Fallback: parse numbered list
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if len(line) < 3 {
-			continue
-		}
-		// Strip leading "1. " or "- " or "1) "
-		for len(line) > 0 && (line[0] >= '0' && line[0] <= '9' || line[0] == '.' || line[0] == '-' || line[0] == ')' || line[0] == ' ') {
-			line = line[1:]
-		}
-		line = strings.TrimSpace(line)
-		if line != "" {
-			entries = append(entries, PlanEntry{Description: line, Status: "pending"})
-		}
-	}
-
-	if len(entries) > 0 {
-		return &Plan{Entries: entries}
-	}
-	return &Plan{}
-}
-
-func extractJSON(s string) string {
-	start := strings.Index(s, "[")
-	end := strings.LastIndex(s, "]")
-	if start >= 0 && end > start {
-		return s[start : end+1]
-	}
-	return s
-}
-
-func sendPlanUpdate(ctx context.Context, conn *acp.AgentSideConnection, sid acp.SessionId, plan *Plan) {
-	entries := make([]acp.PlanEntry, len(plan.Entries))
-	for i, e := range plan.Entries {
-		entries[i] = acp.PlanEntry{
-			Content:  e.Description,
-			Status:   acp.PlanEntryStatus(e.Status),
-			Priority: acp.PlanEntryPriorityMedium,
-		}
-	}
-	_ = conn.SessionUpdate(ctx, acp.SessionNotification{
-		SessionId: sid,
-		Update:    acp.UpdatePlan(entries...),
-	})
-}
-
-func planToText(plan *Plan) string {
-	var b strings.Builder
-	for i, e := range plan.Entries {
-		fmt.Fprintf(&b, "%d. %s [%s]\n", i+1, e.Description, e.Status)
-	}
-	return b.String()
-}
-
-func itoa(n int) string { return fmt.Sprintf("%d", n) }
-
 func (a *EinoAgent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	sid := string(params.SessionId)
 	if s, ok := a.sessions.Get(sid); ok {
@@ -580,13 +438,7 @@ func (a *EinoAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSe
 }
 
 func (a *EinoAgent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
-	sid := string(params.SessionId)
-	s, ok := a.sessions.Get(sid)
-	if !ok {
-		return acp.SetSessionModeResponse{}, fmt.Errorf("session %s not found", sid)
-	}
-	s.SetMode(string(params.ModeId))
-	slog.Info("session mode set", "session", sid, "mode", params.ModeId)
+	// No-op: all sessions run in agent mode. Plan/task management is handled by plantask middleware.
 	return acp.SetSessionModeResponse{}, nil
 }
 
@@ -608,21 +460,9 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 
 	ctx = ContextWithACP(ctx, conn, acp.SessionId(sid))
 
-	// Different resume actions based on what caused the interrupt
-	plan := s.GetPlan()
-	if plan != nil {
-		s.ConsumeResume()
-		execMsg := schema.UserMessage("Execute the plan step by step. Use the available tools to accomplish each step.\n\nPlan to execute:\n" + planToText(plan))
-		s.AppendMessages(execMsg)
-		if err := a.runReAct(ctx, conn, s); err != nil {
-			return acp.ResumeSessionResponse{}, err
-		}
-		sendPlanUpdate(ctx, conn, acp.SessionId(sid), plan)
-	} else {
-		s.ConsumeResume()
-		if err := a.runReAct(ctx, conn, s); err != nil {
-			return acp.ResumeSessionResponse{}, err
-		}
+	s.ConsumeResume()
+	if err := a.runReAct(ctx, conn, s); err != nil {
+		return acp.ResumeSessionResponse{}, err
 	}
 
 	return acp.ResumeSessionResponse{}, nil
@@ -818,55 +658,80 @@ func processNonStreaming(
 }
 
 // =========================================================================
-// Task filesystem backend — minimal in-memory storage for plantask
+// Store-backed task filesystem for plantask — persisted to SQLite
 // =========================================================================
 
-type taskFS struct {
-	mu    sync.Mutex
-	files map[string]string // path → content
+type storeTaskFS struct {
+	mu        sync.Mutex
+	store     *Store
+	sessionID string
+	cache     map[string]string // path → content
+	dirty     bool
 }
 
-func newTaskFS() *taskFS {
-	return &taskFS{files: make(map[string]string)}
+func newStoreTaskFS(store *Store, sessionID string) *storeTaskFS {
+	return &storeTaskFS{store: store, sessionID: sessionID, cache: make(map[string]string)}
 }
 
-func (t *taskFS) LsInfo(ctx context.Context, req *plantask.LsInfoRequest) ([]plantask.FileInfo, error) {
+func (t *storeTaskFS) loadFromDB() {
+	data, err := t.store.LoadTasks(t.sessionID)
+	if err != nil || data == nil {
+		return
+	}
+	t.cache = data
+}
+
+func (t *storeTaskFS) saveToDB() {
+	if !t.dirty {
+		return
+	}
+	_ = t.store.SaveTasks(t.sessionID, t.cache)
+	t.dirty = false
+}
+
+func (t *storeTaskFS) LsInfo(ctx context.Context, req *plantask.LsInfoRequest) ([]plantask.FileInfo, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.loadFromDB()
 
 	var out []plantask.FileInfo
-	for path := range t.files {
-		if path == req.Path || (strings.HasPrefix(path, req.Path+"/") && req.Path != "") {
-			out = append(out, plantask.FileInfo{Path: path, IsDir: false, Size: int64(len(t.files[path]))})
-		}
+	for path, content := range t.cache {
+		out = append(out, plantask.FileInfo{Path: path, IsDir: false, Size: int64(len(content))})
 	}
 	return out, nil
 }
 
-func (t *taskFS) Read(ctx context.Context, req *plantask.ReadRequest) (*filesystem.FileContent, error) {
+func (t *storeTaskFS) Read(ctx context.Context, req *plantask.ReadRequest) (*filesystem.FileContent, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.loadFromDB()
 
-	content, ok := t.files[req.FilePath]
+	content, ok := t.cache[req.FilePath]
 	if !ok {
 		return nil, fmt.Errorf("file not found: %s", req.FilePath)
 	}
 	return &filesystem.FileContent{Content: content}, nil
 }
 
-func (t *taskFS) Write(ctx context.Context, req *plantask.WriteRequest) error {
+func (t *storeTaskFS) Write(ctx context.Context, req *plantask.WriteRequest) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.loadFromDB()
 
-	t.files[req.FilePath] = req.Content
+	t.cache[req.FilePath] = req.Content
+	t.dirty = true
+	t.saveToDB()
 	return nil
 }
 
-func (t *taskFS) Delete(ctx context.Context, req *plantask.DeleteRequest) error {
+func (t *storeTaskFS) Delete(ctx context.Context, req *plantask.DeleteRequest) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.loadFromDB()
 
-	delete(t.files, req.FilePath)
+	delete(t.cache, req.FilePath)
+	t.dirty = true
+	t.saveToDB()
 	return nil
 }
 
