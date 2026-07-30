@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"os"
+	"strconv"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -18,6 +19,7 @@ type Config struct {
 	LLMModel      string `json:"llm_model"`
 	SystemPrompt  string `json:"system_prompt"`
 	MaxIterations int    `json:"max_iterations"`
+	ContextWindow int    `json:"context_window"` // LLM context window size, default 131072 (128K)
 	DataDir       string `json:"data_dir"`
 	DBPath        string `json:"db_path"`
 	Listen        string `json:"listen"`     // "stdio" (default), "tcp://host:port", "unix:///path/to/sock"
@@ -29,6 +31,7 @@ func DefaultConfig() Config {
 		LLMProvider:   "openai-compatible",
 		LLMModel:      "gpt-4o",
 		MaxIterations: 20,
+		ContextWindow: 131072,
 		Listen:        "stdio",
 	LogLevel:      "info",
 		SystemPrompt:  "You are a helpful AI assistant. You can read and write files on the user's system using the available tools.",
@@ -68,6 +71,11 @@ func LoadConfig() Config {
 	}
 	if v := os.Getenv("ACP_LISTEN"); v != "" {
 		cfg.Listen = v
+	}
+	if v := os.Getenv("ACP_CONTEXT_WINDOW"); v != "" {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			cfg.ContextWindow = n
+		}
 	}
 	if v := os.Getenv("ACP_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
