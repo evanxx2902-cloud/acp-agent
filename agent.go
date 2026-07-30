@@ -196,7 +196,7 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, sessionID string, too
 	sumMW, err := summarization.New(ctx, &summarization.Config{
 		Model: a.chatModel,
 		Trigger: &summarization.TriggerCondition{
-			ContextTokens:   a.cfg.ContextWindow / 2, // summarise at 50% of window
+			ContextTokens:   int(float64(a.cfg.ContextWindow) * a.cfg.SummarizationTrigger),
 			ContextMessages: 100,
 		},
 	})
