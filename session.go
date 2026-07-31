@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -22,16 +23,18 @@ import (
 type Session struct {
 	ID       string
 	mu       sync.Mutex
-	messages []*schema.Message // in-memory cache, next seq for new messages
-	seq      int               // next message sequence number
+	messages []*schema.Message
+	seq      int // next message sequence number
 	cancel   context.CancelFunc
 	store    *Store
 	mode     string // "agent" (default) or "plan"
-	status   string // "active" or "closed"
+	status   string // "active", "idle", "closed"
+
+	lastHeartbeat time.Time // updated by _heartbeat extension method
 
 	mcpManager *Manager
 	cmAgent    *adk.ChatModelAgent
-	dirty      bool // true if agent needs rebuild
+	dirty      bool
 }
 
 func (s *Session) AppendMessages(msgs ...*schema.Message) {
@@ -143,6 +146,18 @@ func (s *Session) SetStatus(st string) {
 	}
 }
 
+func (s *Session) Touch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastHeartbeat = time.Now()
+}
+
+func (s *Session) LastHeartbeat() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastHeartbeat
+}
+
 // =========================================================================
 // SessionManager — in-memory map backed by SQLite Store
 // =========================================================================
@@ -248,6 +263,26 @@ func (sm *SessionManager) List() ([]SessionMeta, error) {
 
 func (sm *SessionManager) Exists(id string) (bool, error) {
 	return sm.store.SessionExists(id)
+}
+
+// StartIdleScanner runs a background goroutine that marks active sessions
+// as idle when their heartbeat expires.
+func (sm *SessionManager) StartIdleScanner(interval, timeout time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			sm.mu.Lock()
+			now := time.Now()
+			for _, s := range sm.sessions {
+				if s.Status() == "active" && now.Sub(s.LastHeartbeat()) > timeout {
+					s.SetStatus("idle")
+					slog.Info("session marked idle (heartbeat expired)", "session", s.ID)
+				}
+			}
+			sm.mu.Unlock()
+		}
+	}()
 }
 
 // =========================================================================

@@ -64,6 +64,9 @@ func main() {
 	// Global callbacks: trace component invocations
 	callbacks.AppendGlobalHandlers(newAgentCallback())
 
+	// Start idle scanner: marks sessions idle if no heartbeat for 30s
+	sessionMgr.StartIdleScanner(15*time.Second, 30*time.Second)
+
 	switch {
 	case strings.HasPrefix(cfg.Listen, "tcp://"):
 		addr := strings.TrimPrefix(cfg.Listen, "tcp://")
@@ -187,7 +190,7 @@ type EinoAgent struct {
 	chatModel model.ToolCallingChatModel
 	sessions  *SessionManager
 	store     *Store
-	conn      *acp.AgentSideConnection // per-connection, nil if not set
+	conn      *acp.AgentSideConnection
 }
 
 func (a *EinoAgent) buildSessionAgent(ctx context.Context, sessionID string, tools []tool.BaseTool, systemPrompt string, maxIterations int, modeHint string) (*adk.ChatModelAgent, error) {
@@ -266,6 +269,9 @@ func (a *EinoAgent) Authenticate(ctx context.Context, params acp.AuthenticateReq
 
 func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	sid := randomID()
+	if s, ok := a.sessions.Get(sid); ok && s.Status() != "closed" {
+		return acp.NewSessionResponse{}, fmt.Errorf("session %s already exists and is %s", sid, s.Status())
+	}
 
 	// System prompt: client can override via _meta.system_prompt
 	systemPrompt := a.cfg.SystemPrompt
@@ -302,6 +308,7 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 	}
 
 	s.SetMCAgent(cmAgent, mcpMgr)
+	s.Touch()
 
 	return acp.NewSessionResponse{SessionId: acp.SessionId(sid)}, nil
 }
@@ -338,8 +345,25 @@ func (a *EinoAgent) LoadSession(ctx context.Context, params acp.LoadSessionReque
 		return acp.LoadSessionResponse{}, fmt.Errorf("build agent: %w", err)
 	}
 	s.SetMCAgent(cmAgent, mcpMgr)
+	s.SetStatus("active")
+	s.Touch()
 
 	return acp.LoadSessionResponse{}, nil
+}
+
+func (a *EinoAgent) requireActive(sid string) (*Session, error) {
+	s, ok := a.sessions.Get(sid)
+	if !ok {
+		return nil, fmt.Errorf("session %s not found", sid)
+	}
+	st := s.Status()
+	if st == "closed" {
+		return nil, fmt.Errorf("session %s is closed", sid)
+	}
+	if st == "idle" {
+		return nil, fmt.Errorf("session %s is idle, use resume to re-activate", sid)
+	}
+	return s, nil
 }
 
 func (a *EinoAgent) Cancel(ctx context.Context, params acp.CancelNotification) error {
@@ -352,16 +376,13 @@ func (a *EinoAgent) Cancel(ctx context.Context, params acp.CancelNotification) e
 
 func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
 	sid := string(params.SessionId)
-	s, ok := a.sessions.Get(sid)
-	if !ok {
-		return acp.PromptResponse{}, fmt.Errorf("session %s not found", sid)
-	}
-
-	if s.Status() == "idle" {
-		s.SetStatus("active")
+	s, err := a.requireActive(sid)
+	if err != nil {
+		return acp.PromptResponse{}, err
 	}
 
 	s.Cancel()
+	s.Touch()
 
 	ctx, cancel := context.WithCancel(ctx)
 	s.SetCancel(cancel)
@@ -471,13 +492,13 @@ func (a *EinoAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSe
 
 func (a *EinoAgent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	sid := string(params.SessionId)
-	s, ok := a.sessions.Get(sid)
-	if !ok {
-		return acp.SetSessionModeResponse{}, fmt.Errorf("session %s not found", sid)
+	s, err := a.requireActive(sid)
+	if err != nil {
+		return acp.SetSessionModeResponse{}, err
 	}
 	mode := string(params.ModeId)
 	s.SetMode(mode)
-	s.SetDirty() // trigger agent rebuild on next Prompt
+	s.SetDirty()
 	slog.Info("session mode set", "session", sid, "mode", mode)
 	return acp.SetSessionModeResponse{}, nil
 }
@@ -500,6 +521,9 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 		s.SetMCAgent(cmAgent, nil)
 	}
 
+	s.SetStatus("active")
+	s.Touch()
+
 	conn := a.conn
 	if conn == nil {
 		return acp.ResumeSessionResponse{}, fmt.Errorf("agent connection not set")
@@ -519,8 +543,42 @@ func (a *EinoAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionR
 }
 
 func (a *EinoAgent) Logout(ctx context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
-	// No-op: we don't have authentication, so nothing to revoke
 	return acp.LogoutResponse{}, nil
+}
+
+// =========================================================================
+// Extension methods — ACP _ prefixed custom methods
+// =========================================================================
+
+func (a *EinoAgent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	switch method {
+	case "_heartbeat":
+		var req struct {
+			SessionIDs []string `json:"sessionIds"`
+		}
+		json.Unmarshal(params, &req)
+		for _, sid := range req.SessionIDs {
+			if s, ok := a.sessions.Get(sid); ok {
+				s.Touch()
+			}
+		}
+		return map[string]any{"ok": true, "ts": time.Now().Unix()}, nil
+
+	case "_release":
+		var req struct {
+			SessionIDs []string `json:"sessionIds"`
+		}
+		json.Unmarshal(params, &req)
+		for _, sid := range req.SessionIDs {
+			if s, ok := a.sessions.Get(sid); ok {
+				s.SetStatus("idle")
+			}
+		}
+		return map[string]any{"ok": true}, nil
+
+	default:
+		return nil, acp.NewMethodNotFound(method)
+	}
 }
 
 // =========================================================================
