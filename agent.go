@@ -204,10 +204,9 @@ func (a *EinoAgent) buildSessionAgent(ctx context.Context, sessionID string, too
 		return nil, fmt.Errorf("create summarization: %w", err)
 	}
 
-	// Plan-task middleware: inject task management tools, persisted to SQLite
-	taskBackend := newStoreTaskFS(a.store, sessionID)
+	// Plan-task middleware: inject task management tools
 	planMW, err := plantask.New(ctx, &plantask.Config{
-		Backend: taskBackend,
+		Backend: newTaskFS(),
 		BaseDir: "/tasks",
 	})
 	if err != nil {
@@ -283,7 +282,7 @@ func (a *EinoAgent) NewSession(ctx context.Context, params acp.NewSessionRequest
 		initMsgs = append(initMsgs, schema.SystemMessage(systemPrompt))
 	}
 
-	s, err := a.sessions.Create(sid, initMsgs...)
+	s, err := a.sessions.Create(sid, params.Meta, initMsgs...)
 	if err != nil {
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
@@ -435,8 +434,8 @@ func (a *EinoAgent) CloseSession(ctx context.Context, params acp.CloseSessionReq
 	sid := string(params.SessionId)
 	if s, ok := a.sessions.Get(sid); ok {
 		s.CloseMCP()
+		s.SetStatus("closed")
 	}
-	a.sessions.Delete(sid)
 	return acp.CloseSessionResponse{}, nil
 }
 
@@ -449,9 +448,11 @@ func (a *EinoAgent) ListSessions(ctx context.Context, params acp.ListSessionsReq
 	items := make([]acp.SessionInfo, 0, len(metas))
 	for _, m := range metas {
 		updatedAt := m.UpdatedAt.Format(time.RFC3339)
+		title := fmt.Sprintf("%s@%s", m.Username, m.BusinessType)
 		items = append(items, acp.SessionInfo{
 			SessionId: acp.SessionId(m.ID),
 			Cwd:       "/",
+			Title:     &title,
 			UpdatedAt: &updatedAt,
 		})
 	}
@@ -721,80 +722,49 @@ func compactToolMsg(msg *schema.Message) *schema.Message {
 }
 
 // =========================================================================
-// Store-backed task filesystem for plantask — persisted to SQLite
+// In-memory task filesystem for plantask
 // =========================================================================
 
-type storeTaskFS struct {
-	mu        sync.Mutex
-	store     *Store
-	sessionID string
-	cache     map[string]string // path → content
-	dirty     bool
+type taskFS struct {
+	mu    sync.Mutex
+	files map[string]string
 }
 
-func newStoreTaskFS(store *Store, sessionID string) *storeTaskFS {
-	return &storeTaskFS{store: store, sessionID: sessionID, cache: make(map[string]string)}
+func newTaskFS() *taskFS {
+	return &taskFS{files: make(map[string]string)}
 }
 
-func (t *storeTaskFS) loadFromDB() {
-	data, err := t.store.LoadTasks(t.sessionID)
-	if err != nil || data == nil {
-		return
-	}
-	t.cache = data
-}
-
-func (t *storeTaskFS) saveToDB() {
-	if !t.dirty {
-		return
-	}
-	_ = t.store.SaveTasks(t.sessionID, t.cache)
-	t.dirty = false
-}
-
-func (t *storeTaskFS) LsInfo(ctx context.Context, req *plantask.LsInfoRequest) ([]plantask.FileInfo, error) {
+func (t *taskFS) LsInfo(ctx context.Context, req *plantask.LsInfoRequest) ([]plantask.FileInfo, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.loadFromDB()
-
 	var out []plantask.FileInfo
-	for path, content := range t.cache {
+	for path, content := range t.files {
 		out = append(out, plantask.FileInfo{Path: path, IsDir: false, Size: int64(len(content))})
 	}
 	return out, nil
 }
 
-func (t *storeTaskFS) Read(ctx context.Context, req *plantask.ReadRequest) (*filesystem.FileContent, error) {
+func (t *taskFS) Read(ctx context.Context, req *plantask.ReadRequest) (*filesystem.FileContent, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.loadFromDB()
-
-	content, ok := t.cache[req.FilePath]
+	content, ok := t.files[req.FilePath]
 	if !ok {
 		return nil, fmt.Errorf("file not found: %s", req.FilePath)
 	}
 	return &filesystem.FileContent{Content: content}, nil
 }
 
-func (t *storeTaskFS) Write(ctx context.Context, req *plantask.WriteRequest) error {
+func (t *taskFS) Write(ctx context.Context, req *plantask.WriteRequest) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.loadFromDB()
-
-	t.cache[req.FilePath] = req.Content
-	t.dirty = true
-	t.saveToDB()
+	t.files[req.FilePath] = req.Content
 	return nil
 }
 
-func (t *storeTaskFS) Delete(ctx context.Context, req *plantask.DeleteRequest) error {
+func (t *taskFS) Delete(ctx context.Context, req *plantask.DeleteRequest) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.loadFromDB()
-
-	delete(t.cache, req.FilePath)
-	t.dirty = true
-	t.saveToDB()
+	delete(t.files, req.FilePath)
 	return nil
 }
 
