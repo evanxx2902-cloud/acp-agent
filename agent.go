@@ -74,6 +74,8 @@ func main() {
 	default:
 		serveStdio(cfg, chatModel, sessionMgr, store, logger)
 	}
+	_ = store.MarkActiveAsIdle()
+	slog.Info("agent server shutting down")
 }
 
 func serveStdio(cfg Config, chatModel model.ToolCallingChatModel, sessionMgr *SessionManager, store *Store, logger *slog.Logger) {
@@ -353,6 +355,10 @@ func (a *EinoAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.P
 	s, ok := a.sessions.Get(sid)
 	if !ok {
 		return acp.PromptResponse{}, fmt.Errorf("session %s not found", sid)
+	}
+
+	if s.Status() == "idle" {
+		s.SetStatus("active")
 	}
 
 	s.Cancel()

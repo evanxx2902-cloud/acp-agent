@@ -379,6 +379,14 @@ func (s *Store) SetSessionStatus(id, status string) error {
 	return err
 }
 
+func (s *Store) MarkActiveAsIdle() error {
+	_, err := s.db.Exec(
+		"UPDATE sessions SET status = 'idle', updated_at = ? WHERE status = 'active'",
+		time.Now().Unix(),
+	)
+	return err
+}
+
 func (s *Store) DeleteSession(id string) error {
 	tx, _ := s.db.Begin()
 	if tx != nil {
