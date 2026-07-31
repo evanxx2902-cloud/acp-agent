@@ -417,7 +417,7 @@ func (a *EinoAgent) runReAct(ctx context.Context, conn *acp.AgentSideConnection,
 			return fmt.Errorf("agent error: %w", event.Err)
 		}
 		if event.Output != nil && event.Output.MessageOutput != nil {
-			if err := ProcessAgentEvent(ctx, conn, s.ID, event, &finalContent); err != nil {
+			if err := ProcessAgentEvent(ctx, conn, s, event, &finalContent); err != nil {
 				slog.Error("failed to process agent event", "error", err)
 			}
 		}
@@ -602,21 +602,21 @@ func ContentBlocksToMessage(blocks []acp.ContentBlock) *schema.Message {
 func ProcessAgentEvent(
 	ctx context.Context,
 	conn *acp.AgentSideConnection,
-	sid string,
+	s *Session,
 	event *adk.AgentEvent,
 	finalContent *strings.Builder,
 ) error {
 	mv := event.Output.MessageOutput
 	if mv.IsStreaming {
-		return processStreaming(ctx, conn, sid, mv, finalContent)
+		return processStreaming(ctx, conn, s, mv, finalContent)
 	}
-	return processNonStreaming(ctx, conn, sid, mv, finalContent)
+	return processNonStreaming(ctx, conn, s, mv, finalContent)
 }
 
 func processStreaming(
 	ctx context.Context,
 	conn *acp.AgentSideConnection,
-	sid string,
+	s *Session,
 	mv *adk.MessageVariant,
 	finalContent *strings.Builder,
 ) error {
@@ -641,7 +641,7 @@ func processStreaming(
 		case schema.Assistant:
 			if chunk.Content != "" {
 				if err := conn.SessionUpdate(ctx, acp.SessionNotification{
-					SessionId: acp.SessionId(sid),
+					SessionId: acp.SessionId(s.ID),
 					Update:    acp.UpdateAgentMessageText(chunk.Content),
 				}); err != nil {
 					return err
@@ -650,14 +650,19 @@ func processStreaming(
 			}
 			if chunk.ReasoningContent != "" {
 				if err := conn.SessionUpdate(ctx, acp.SessionNotification{
-					SessionId: acp.SessionId(sid),
+					SessionId: acp.SessionId(s.ID),
 					Update:    acp.UpdateAgentThoughtText(chunk.ReasoningContent),
 				}); err != nil {
 					return err
 				}
 			}
+			// Save tool calls (small — just names and args)
+			if len(chunk.ToolCalls) > 0 {
+				s.AppendMessages(chunk)
+			}
 		case schema.Tool:
-			slog.Debug("streaming tool result", "toolName", mv.ToolName, "content", chunk.Content)
+			// Stream tool result to client, store lightweight status only
+			s.AppendMessages(compactToolMsg(chunk))
 		}
 	}
 	return nil
@@ -666,7 +671,7 @@ func processStreaming(
 func processNonStreaming(
 	ctx context.Context,
 	conn *acp.AgentSideConnection,
-	sid string,
+	s *Session,
 	mv *adk.MessageVariant,
 	finalContent *strings.Builder,
 ) error {
@@ -679,7 +684,7 @@ func processNonStreaming(
 	case schema.Assistant:
 		if msg.Content != "" {
 			if err := conn.SessionUpdate(ctx, acp.SessionNotification{
-				SessionId: acp.SessionId(sid),
+				SessionId: acp.SessionId(s.ID),
 				Update:    acp.UpdateAgentMessageText(msg.Content),
 			}); err != nil {
 				return err
@@ -688,16 +693,31 @@ func processNonStreaming(
 		}
 		if msg.ReasoningContent != "" {
 			if err := conn.SessionUpdate(ctx, acp.SessionNotification{
-				SessionId: acp.SessionId(sid),
+				SessionId: acp.SessionId(s.ID),
 				Update:    acp.UpdateAgentThoughtText(msg.ReasoningContent),
 			}); err != nil {
 				return err
 			}
 		}
+		// Save assistant messages that have tool calls
+		if len(msg.ToolCalls) > 0 {
+			s.AppendMessages(msg)
+		}
 	case schema.Tool:
-		slog.Debug("non-streaming tool result", "toolName", mv.ToolName, "content", msg.Content)
+		// Store lightweight status only (not full content)
+		s.AppendMessages(compactToolMsg(msg))
 	}
 	return nil
+}
+
+// compactToolMsg creates a lightweight tool message: only name + status, no content.
+func compactToolMsg(msg *schema.Message) *schema.Message {
+	return &schema.Message{
+		Role:       schema.Tool,
+		ToolCallID: msg.ToolCallID,
+		ToolName:   msg.ToolName,
+		Content:    "(completed)",
+	}
 }
 
 // =========================================================================
