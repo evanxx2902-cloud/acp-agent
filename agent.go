@@ -558,7 +558,7 @@ func (a *EinoAgent) HandleExtensionMethod(ctx context.Context, method string, pa
 		}
 		json.Unmarshal(params, &req)
 		for _, sid := range req.SessionIDs {
-			if s, ok := a.sessions.Get(sid); ok {
+			if s, ok := a.sessions.Get(sid); ok && s.Status() == "active" {
 				s.Touch()
 			}
 		}
@@ -570,7 +570,7 @@ func (a *EinoAgent) HandleExtensionMethod(ctx context.Context, method string, pa
 		}
 		json.Unmarshal(params, &req)
 		for _, sid := range req.SessionIDs {
-			if s, ok := a.sessions.Get(sid); ok {
+			if s, ok := a.sessions.Get(sid); ok && s.Status() != "closed" {
 				s.SetStatus("idle")
 			}
 		}
