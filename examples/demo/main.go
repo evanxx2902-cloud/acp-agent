@@ -97,14 +97,15 @@ func runClient(autoYes bool, connectAddr string, sysPrompt string, mode string, 
 			{Stdio: &acp.McpServerStdio{Command: selfPath, Args: []string{"--mcp-server"}}},
 		},
 	}
-	if sysPrompt != "" || maxIter > 0 {
-		sessReq.Meta = make(map[string]any)
-		if sysPrompt != "" {
-			sessReq.Meta["system_prompt"] = sysPrompt
-		}
-		if maxIter > 0 {
-			sessReq.Meta["max_iterations"] = float64(maxIter)
-		}
+	sessReq.Meta = make(map[string]any)
+	if sysPrompt != "" {
+		sessReq.Meta["system_prompt"] = sysPrompt
+	}
+	if maxIter > 0 {
+		sessReq.Meta["max_iterations"] = float64(maxIter)
+	}
+	if mode != "" {
+		sessReq.Meta["mode"] = mode
 	}
 	newSess, err := conn.NewSession(ctx, sessReq)
 	if err != nil {
@@ -112,10 +113,6 @@ func runClient(autoYes bool, connectAddr string, sysPrompt string, mode string, 
 	}
 	fmt.Printf("Session: %s\n", newSess.SessionId)
 	if mode == "plan" {
-		conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
-			SessionId: newSess.SessionId,
-			ModeId:    acp.SessionModeId(mode),
-		})
 		fmt.Printf("Mode:     plan\n")
 	}
 	fmt.Println()

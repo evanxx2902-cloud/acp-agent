@@ -2,54 +2,87 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"acp/ent"
+	entSchema "acp/ent/schema"
+	entSession "acp/ent/session"
+	entMessage "acp/ent/sessionmessage"
+
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
-	_ "modernc.org/sqlite"
+	"github.com/google/uuid"
 )
 
 // =========================================================================
-// Session — per-session runtime state (cache backed by SQLite)
+// RuntimeSession — per-session runtime state (cache backed by Ent/SQLite)
 // =========================================================================
 
-type Session struct {
-	ID       string
-	mu       sync.Mutex
-	messages []*schema.Message
-	seq      int // next message sequence number
-	cancel   context.CancelFunc
-	store    *Store
-	mode     string // "agent" (default) or "plan"
-	status   string // "active", "idle", "closed"
-
-	lastHeartbeat time.Time // updated by _heartbeat extension method
-
-	mcpManager *Manager
-	cmAgent    *adk.ChatModelAgent
-	dirty      bool
+// NewSessionParams holds all parameters for creating a session.
+type NewSessionParams struct {
+	UserID                    int64
+	Username                  string
+	BusinessID                string
+	BusinessType              string
+	BusinessMeta              map[string]any
+	Mode                      string
+	HeartbeatInterval         int
+	SummarizationTriggerRatio float64
+	MaxIterations             int
+	SystemPrompt              string
+	OwnerAgent                string // connection identifier for ownership
 }
 
-func (s *Session) AppendMessages(msgs ...*schema.Message) {
+// SessionMeta is a lightweight public view of a session.
+type SessionMeta struct {
+	ID           string
+	Status       string
+	Mode         string
+	UserID       int64
+	Username     string
+	BusinessID   string
+	BusinessType string
+	BusinessMeta map[string]any
+	MessageCount int
+	CreateTime   time.Time
+	UpdateTime   time.Time
+}
+
+type RuntimeSession struct {
+	ID                        string
+	Mode                      string
+	Summary                   string
+	HeartbeatInterval         int
+	SummarizationTriggerRatio float64
+	MaxIterations             int
+	BusinessMeta              map[string]any
+
+	mu             sync.Mutex
+	messages       []*schema.Message
+	seq            int
+	cancel         context.CancelFunc
+	ctx            context.Context
+	mcpManager     *Manager
+	cmAgent        *adk.ChatModelAgent
+	heartbeatTimer *time.Timer
+	lockedBy       string
+	lockedAt       time.Time
+	status         string
+	promptMu       sync.Mutex // prevents concurrent prompts on same session
+	ownerAgent     string     // connection that currently owns this session
+}
+
+func (s *RuntimeSession) AppendMessages(msgs ...*schema.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, msg := range msgs {
-		s.messages = append(s.messages, msg)
-		if s.store != nil {
-			_ = s.store.AppendMessage(s.ID, s.seq, msg)
-			s.seq++
-		}
-	}
+	s.messages = append(s.messages, msgs...)
+	s.seq += len(msgs)
 }
 
-func (s *Session) Messages() []*schema.Message {
+func (s *RuntimeSession) Messages() []*schema.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := make([]*schema.Message, len(s.messages))
@@ -57,13 +90,13 @@ func (s *Session) Messages() []*schema.Message {
 	return cp
 }
 
-func (s *Session) SetCancel(cancel context.CancelFunc) {
+func (s *RuntimeSession) SetCancel(cancel context.CancelFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cancel = cancel
 }
 
-func (s *Session) Cancel() {
+func (s *RuntimeSession) Cancel() {
 	s.mu.Lock()
 	cancel := s.cancel
 	s.cancel = nil
@@ -73,55 +106,26 @@ func (s *Session) Cancel() {
 	}
 }
 
-func (s *Session) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *Manager) {
+func (s *RuntimeSession) SetMCAgent(cmAgent *adk.ChatModelAgent, mgr *Manager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cmAgent = cmAgent
 	s.mcpManager = mgr
-	s.dirty = false
 }
 
-func (s *Session) RebuildAgent(cmAgent *adk.ChatModelAgent) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cmAgent = cmAgent
-	s.dirty = false
-}
-
-func (s *Session) GetAgent() *adk.ChatModelAgent {
+func (s *RuntimeSession) GetAgent() *adk.ChatModelAgent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cmAgent
 }
 
-func (s *Session) SetMode(mode string) {
+func (s *RuntimeSession) GetMCPManager() *Manager {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.mode = mode
+	return s.mcpManager
 }
 
-func (s *Session) GetMode() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.mode == "" {
-		return "agent"
-	}
-	return s.mode
-}
-
-func (s *Session) SetDirty() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.dirty = true
-}
-
-func (s *Session) IsDirty() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.dirty
-}
-
-func (s *Session) CloseMCP() {
+func (s *RuntimeSession) CloseMCP() {
 	s.mu.Lock()
 	mgr := s.mcpManager
 	s.mcpManager = nil
@@ -131,404 +135,460 @@ func (s *Session) CloseMCP() {
 	}
 }
 
-func (s *Session) Status() string {
+func (s *RuntimeSession) Status() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.status
 }
 
-func (s *Session) SetStatus(st string) {
+func (s *RuntimeSession) SetStatus(st string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = st
-	if s.store != nil {
-		_ = s.store.SetSessionStatus(s.ID, st)
+}
+
+func (s *RuntimeSession) ResetHeartbeat() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.heartbeatTimer != nil {
+		timeout := time.Duration(s.HeartbeatInterval*3) * time.Second
+		s.heartbeatTimer.Reset(timeout)
 	}
 }
 
-func (s *Session) Touch() {
+func (s *RuntimeSession) StopHeartbeat() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastHeartbeat = time.Now()
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
+		s.heartbeatTimer = nil
+	}
 }
 
-func (s *Session) LastHeartbeat() time.Time {
+// TryLockPrompt attempts to acquire the prompt lock. Returns false if busy.
+func (s *RuntimeSession) TryLockPrompt() bool {
+	return s.promptMu.TryLock()
+}
+
+// UnlockPrompt releases the prompt lock.
+func (s *RuntimeSession) UnlockPrompt() {
+	s.promptMu.Unlock()
+}
+
+// OwnedBy returns whether this session is owned by the given connection.
+func (s *RuntimeSession) OwnedBy(agentID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.lastHeartbeat
+	return s.lockedBy == agentID
+}
+
+// LockOwnership sets the owning connection.
+func (s *RuntimeSession) LockOwnership(agentID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lockedBy = agentID
+	s.lockedAt = time.Now()
+	s.ownerAgent = agentID
 }
 
 // =========================================================================
-// SessionManager — in-memory map backed by SQLite Store
+// SessionManager — global singleton, in-memory cache backed by Ent
 // =========================================================================
 
 type SessionManager struct {
-	mu       sync.Mutex
-	sessions map[string]*Session
-	store    *Store
+	mu        sync.Mutex
+	sessions  map[string]*RuntimeSession
+	entClient *ent.Client
 }
 
-func NewSessionManager(store *Store) *SessionManager {
-	return &SessionManager{
-		sessions: make(map[string]*Session),
-		store:    store,
+var globalSessionManager *SessionManager
+
+func NewSessionManager(entClient *ent.Client) *SessionManager {
+	sm := &SessionManager{
+		sessions:  make(map[string]*RuntimeSession),
+		entClient: entClient,
 	}
+	globalSessionManager = sm
+	return sm
 }
 
-func (sm *SessionManager) Create(id string, meta map[string]any, initialMessages ...*schema.Message) (*Session, error) {
-	userID := ""
-	username := ""
-	businessType := ""
-	businessID := ""
-	if meta != nil {
-		if v, ok := meta["user_id"].(string); ok {
-			userID = v
-		}
-		if v, ok := meta["username"].(string); ok {
-			username = v
-		}
-		if v, ok := meta["business_type"].(string); ok {
-			businessType = v
-		}
-		if v, ok := meta["business_id"].(string); ok {
-			businessID = v
-		}
+func GetSessionManager() *SessionManager {
+	return globalSessionManager
+}
+
+// NewSession creates a new session with server-generated UUID v4.
+func (sm *SessionManager) NewSession(ctx context.Context, params NewSessionParams) (*RuntimeSession, error) {
+	id := uuid.New().String()
+	now := time.Now()
+
+	mode := params.Mode
+	if mode == "" {
+		mode = "agent"
+	}
+	hi := params.HeartbeatInterval
+	if hi <= 0 {
+		hi = 10
+	}
+	maxIter := params.MaxIterations
+	if maxIter <= 0 {
+		maxIter = 20
+	}
+	str := params.SummarizationTriggerRatio
+	if str <= 0 {
+		str = 0.8
+	}
+	businessMeta := params.BusinessMeta
+	if businessMeta == nil {
+		businessMeta = map[string]any{}
 	}
 
-	if err := sm.store.CreateSession(id, userID, username, businessType, businessID, meta); err != nil {
-		return nil, err
+	// Insert session record
+	_, err := sm.entClient.Session.Create().
+		SetID(id).
+		SetStatus(entSession.StatusActive).
+		SetUserID(params.UserID).
+		SetUsername(params.Username).
+		SetBusinessID(params.BusinessID).
+		SetBusinessType(params.BusinessType).
+		SetBusinessMeta(businessMeta).
+		SetMode(mode).
+		SetHeartbeatInterval(hi).
+		SetLockedBy(params.OwnerAgent).
+		SetLockedAt(now).
+		SetCreateTime(now).
+		SetUpdateTime(now).
+		Save(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
 	}
 
-	s := &Session{
-		ID:       id,
-		messages: initialMessages,
-		seq:      len(initialMessages),
-		store:    sm.store,
-		status:   "active",
+	var initMsgs []*schema.Message
+	seq := 0
+
+	// System prompt is persisted as seq=0 message
+	if params.SystemPrompt != "" {
+		initMsgs = append(initMsgs, schema.SystemMessage(params.SystemPrompt))
+		_, err = sm.entClient.SessionMessage.Create().
+			SetSessionID(id).
+			SetSeq(seq).
+			SetRole(entMessage.RoleSystem).
+			SetContent(params.SystemPrompt).
+			SetCreateTime(now).
+			Save(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("save system message: %w", err)
+		}
+		seq++
 	}
 
-	for i, msg := range initialMessages {
-		_ = sm.store.AppendMessage(id, i, msg)
+	timeout := time.Duration(hi*3) * time.Second
+	timer := time.AfterFunc(timeout, func() {
+		sm.onIdleTimeout(id)
+	})
+
+	s := &RuntimeSession{
+		ID:                        id,
+		Mode:                      mode,
+		HeartbeatInterval:         hi,
+		SummarizationTriggerRatio: str,
+		MaxIterations:             maxIter,
+		BusinessMeta:              businessMeta,
+		messages:                  initMsgs,
+		seq:                       seq,
+		status:                    "active",
+		heartbeatTimer:            timer,
+		lockedBy:                  params.OwnerAgent,
+		lockedAt:                  now,
+		ownerAgent:                params.OwnerAgent,
 	}
 
 	sm.mu.Lock()
 	sm.sessions[id] = s
 	sm.mu.Unlock()
+
+	slog.Info("session created", "id", id, "mode", mode)
 	return s, nil
 }
 
-func (sm *SessionManager) Get(id string) (*Session, bool) {
+// GetCached returns a session from the in-memory cache.
+func (sm *SessionManager) GetCached(id string) (*RuntimeSession, bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	s, ok := sm.sessions[id]
 	return s, ok
 }
 
-func (sm *SessionManager) Load(id string) (*Session, error) {
-	meta, err := sm.store.GetSession(id)
+// Resume loads a session from the database and reconnects MCP.
+func (sm *SessionManager) Resume(ctx context.Context, id string, mcpServers []any, ownerAgent string) (*RuntimeSession, error) {
+	// Load session from DB
+	sess, err := sm.entClient.Session.Get(ctx, id)
 	if err != nil {
-		return nil, err
+		if ent.IsNotFound(err) {
+			return nil, fmt.Errorf("session %s not found", id)
+		}
+		return nil, fmt.Errorf("load session: %w", err)
 	}
 
-	msgs, err := sm.store.LoadMessages(id)
-	if err != nil {
-		return nil, err
+	if sess.Status == entSession.StatusClosed {
+		return nil, fmt.Errorf("session %s is closed", id)
+	}
+	if sess.Status != entSession.StatusIdle {
+		return nil, fmt.Errorf("session %s is not idle (status: %s)", id, sess.Status)
 	}
 
-	s := &Session{
-		ID:       id,
-		messages: msgs,
-		seq:      len(msgs),
-		store:    sm.store,
-		mode:     meta.Mode,
-		status:   meta.Status,
+	// Load messages from DB
+	msgs, err := sm.entClient.SessionMessage.Query().
+		Where(entMessage.SessionID(id)).
+		Order(ent.Asc(entMessage.FieldSeq)).
+		All(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load messages: %w", err)
+	}
+
+	messages := make([]*schema.Message, 0, len(msgs))
+	for _, m := range msgs {
+		msg := &schema.Message{
+			Role:    schema.RoleType(m.Role),
+			Content: m.Content,
+		}
+		if m.ToolCallID != "" {
+			msg.ToolCallID = m.ToolCallID
+		}
+		if len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{
+					ID:   tc.ID,
+					Type: "function",
+					Function: schema.FunctionCall{
+						Name:      tc.Name,
+						Arguments: fmt.Sprintf("%v", tc.Arguments),
+					},
+				})
+			}
+		}
+		messages = append(messages, msg)
+	}
+
+	// Update status to active
+	now := time.Now()
+	_, err = sm.entClient.Session.UpdateOneID(id).
+		SetStatus(entSession.StatusActive).
+		SetLockedBy(ownerAgent).
+		SetLockedAt(now).
+		SetUpdateTime(now).
+		Save(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("update session status: %w", err)
+	}
+
+	heartbeatInterval := sess.HeartbeatInterval
+	timeout := time.Duration(heartbeatInterval*3) * time.Second
+	timer := time.AfterFunc(timeout, func() {
+		sm.onIdleTimeout(id)
+	})
+
+	s := &RuntimeSession{
+		ID:                        id,
+		Mode:                      sess.Mode,
+		Summary:                   sess.Summary,
+		HeartbeatInterval:         heartbeatInterval,
+		SummarizationTriggerRatio: 0.8,
+		MaxIterations:             20,
+		BusinessMeta:              sess.BusinessMeta,
+		messages:                  messages,
+		seq:                       len(messages),
+		status:                    "active",
+		heartbeatTimer:            timer,
+		lockedBy:                  ownerAgent,
+		lockedAt:                  now,
+		ownerAgent:                ownerAgent,
 	}
 
 	sm.mu.Lock()
 	sm.sessions[id] = s
 	sm.mu.Unlock()
+
+	slog.Info("session resumed", "id", id)
 	return s, nil
 }
 
-func (sm *SessionManager) Delete(id string) {
+// Close marks a session as closed, disconnects MCP, removes from cache.
+func (sm *SessionManager) Close(ctx context.Context, id string) error {
+	s, ok := sm.GetCached(id)
+	if !ok {
+		return fmt.Errorf("session %s not found in cache", id)
+	}
+
+	s.StopHeartbeat()
+	s.CloseMCP()
+
+	_, err := sm.entClient.Session.UpdateOneID(id).
+		SetStatus(entSession.StatusClosed).
+		SetUpdateTime(time.Now()).
+		Save(ctx)
+	if err != nil {
+		return fmt.Errorf("close session: %w", err)
+	}
+
 	sm.mu.Lock()
 	delete(sm.sessions, id)
 	sm.mu.Unlock()
-	_ = sm.store.DeleteSession(id)
+
+	slog.Info("session closed", "id", id)
+	return nil
 }
 
-func (sm *SessionManager) List() ([]SessionMeta, error) {
-	return sm.store.ListSessions()
-}
-
-func (sm *SessionManager) Exists(id string) (bool, error) {
-	return sm.store.SessionExists(id)
-}
-
-// StartIdleScanner runs a background goroutine that marks active sessions
-// as idle when their heartbeat expires.
-func (sm *SessionManager) StartIdleScanner(interval, timeout time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			sm.mu.Lock()
-			now := time.Now()
-			for _, s := range sm.sessions {
-				if s.Status() == "active" && now.Sub(s.LastHeartbeat()) > timeout {
-					s.SetStatus("idle")
-					slog.Info("session marked idle (heartbeat expired)", "session", s.ID)
-				}
-			}
-			sm.mu.Unlock()
-		}
-	}()
-}
-
-// =========================================================================
-// Store — SQLite persistence
-// =========================================================================
-
-type SessionMeta struct {
-	ID           string
-	Status       string
-	Mode         string
-	UserID       string
-	Username     string
-	BusinessType string
-	BusinessID   string
-	Metadata     map[string]any
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-}
-
-type Store struct {
-	db *sql.DB
-}
-
-func NewStore(dbPath string) (*Store, error) {
-	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create data dir %s: %w", dir, err)
+// MarkIdle transitions a session to idle: disconnect MCP, stop timer, update DB.
+func (sm *SessionManager) MarkIdle(ctx context.Context, id string) error {
+	s, ok := sm.GetCached(id)
+	if !ok {
+		return nil // already gone
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	s.StopHeartbeat()
+	s.CloseMCP()
+	s.SetStatus("idle")
+
+	_, err := sm.entClient.Session.UpdateOneID(id).
+		SetStatus(entSession.StatusIdle).
+		SetUpdateTime(time.Now()).
+		Save(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return fmt.Errorf("mark idle: %w", err)
 	}
 
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("enable WAL: %w", err)
-	}
-
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS sessions (
-			id            TEXT PRIMARY KEY,
-			status        TEXT NOT NULL DEFAULT 'active',
-			mode          TEXT NOT NULL DEFAULT 'agent',
-			user_id       TEXT NOT NULL DEFAULT '',
-			username      TEXT NOT NULL DEFAULT '',
-			business_type TEXT NOT NULL DEFAULT '',
-			business_id   TEXT NOT NULL DEFAULT '',
-			metadata      TEXT NOT NULL DEFAULT '{}',
-			created_at    INTEGER NOT NULL,
-			updated_at    INTEGER NOT NULL
-		)
-	`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create sessions table: %w", err)
-	}
-
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS session_messages (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			session_id   TEXT NOT NULL REFERENCES sessions(id),
-			seq          INTEGER NOT NULL,
-			role         TEXT NOT NULL,
-			content      TEXT NOT NULL DEFAULT '',
-			tool_calls   TEXT DEFAULT NULL,
-			tool_call_id TEXT DEFAULT NULL,
-			tool_name    TEXT DEFAULT NULL,
-			created_at   INTEGER NOT NULL,
-			UNIQUE(session_id, seq)
-		)
-	`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create session_messages table: %w", err)
-	}
-
-	if _, err := db.Exec(
-		"CREATE INDEX IF NOT EXISTS idx_msg_session_seq ON session_messages(session_id, seq)",
-	); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create index: %w", err)
-	}
-
-	return &Store{db: db}, nil
+	slog.Info("session marked idle", "id", id)
+	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
-
-// --- Sessions ---
-
-func (s *Store) CreateSession(id, userID, username, businessType, businessID string, meta map[string]any) error {
-	now := time.Now().Unix()
-	metaJSON := "{}"
-	if meta != nil {
-		b, _ := json.Marshal(meta)
-		metaJSON = string(b)
+// UpdateSummary updates the conversation summary in memory and DB.
+func (sm *SessionManager) UpdateSummary(ctx context.Context, id, summary string) error {
+	s, ok := sm.GetCached(id)
+	if ok {
+		s.mu.Lock()
+		s.Summary = summary
+		s.mu.Unlock()
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, status, mode, user_id, username, business_type, business_id, metadata, created_at, updated_at)
-		 VALUES (?, 'active', 'agent', ?, ?, ?, ?, ?, ?, ?)`,
-		id, userID, username, businessType, businessID, metaJSON, now, now,
-	)
+
+	_, err := sm.entClient.Session.UpdateOneID(id).
+		SetSummary(summary).
+		SetUpdateTime(time.Now()).
+		Save(ctx)
 	return err
 }
 
-func (s *Store) GetSession(id string) (*SessionMeta, error) {
-	var m SessionMeta
-	var ca, ua int64
-	var metaJSON string
-	if err := s.db.QueryRow(
-		"SELECT id, status, mode, user_id, username, business_type, business_id, metadata, created_at, updated_at FROM sessions WHERE id = ?",
-		id,
-	).Scan(&m.ID, &m.Status, &m.Mode, &m.UserID, &m.Username, &m.BusinessType, &m.BusinessID, &metaJSON, &ca, &ua); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("session %s not found", id)
-		}
+// List returns sessions matching the given filters.
+func (sm *SessionManager) List(ctx context.Context) ([]SessionMeta, error) {
+	sessions, err := sm.entClient.Session.Query().
+		Order(ent.Desc(entSession.FieldUpdateTime)).
+		All(ctx)
+	if err != nil {
 		return nil, err
 	}
-	json.Unmarshal([]byte(metaJSON), &m.Metadata)
-	m.CreatedAt = time.Unix(ca, 0)
-	m.UpdatedAt = time.Unix(ua, 0)
-	return &m, nil
+
+	out := make([]SessionMeta, 0, len(sessions))
+	for _, s := range sessions {
+		count, _ := sm.entClient.SessionMessage.Query().
+			Where(entMessage.SessionID(s.ID), entMessage.RoleNEQ(entMessage.RoleSystem)).
+			Count(ctx)
+
+		out = append(out, SessionMeta{
+			ID:           s.ID,
+			Status:       string(s.Status),
+			Mode:         s.Mode,
+			UserID:       s.UserID,
+			Username:     s.Username,
+			BusinessID:   s.BusinessID,
+			BusinessType: s.BusinessType,
+			BusinessMeta: s.BusinessMeta,
+			MessageCount: count,
+			CreateTime:   s.CreateTime,
+			UpdateTime:   s.UpdateTime,
+		})
+	}
+	return out, nil
 }
 
-func (s *Store) SetSessionStatus(id, status string) error {
-	_, err := s.db.Exec(
-		"UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?",
-		status, time.Now().Unix(), id,
-	)
+// MarkActiveAsIdle marks all active sessions as idle (called on shutdown).
+func (sm *SessionManager) MarkActiveAsIdle(ctx context.Context) error {
+	_, err := sm.entClient.Session.Update().
+		Where(entSession.StatusEQ(entSession.StatusActive)).
+		SetStatus(entSession.StatusIdle).
+		SetUpdateTime(time.Now()).
+		Save(ctx)
 	return err
 }
 
-func (s *Store) MarkActiveAsIdle() error {
-	_, err := s.db.Exec(
-		"UPDATE sessions SET status = 'idle', updated_at = ? WHERE status = 'active'",
-		time.Now().Unix(),
-	)
-	return err
+// PersistMessages saves in-memory messages to the database.
+func (sm *SessionManager) PersistMessages(ctx context.Context, sessionID string, startSeq int, messages []*schema.Message) error {
+	now := time.Now()
+	for i, msg := range messages {
+		seq := startSeq + i
+		var toolCalls []entSchema.ToolCall
+		for _, tc := range msg.ToolCalls {
+			toolCalls = append(toolCalls, entSchema.ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: parseArgsMap(tc.Function.Arguments),
+			})
+		}
+
+		role := entMessage.RoleUser
+		switch msg.Role {
+		case "system":
+			role = entMessage.RoleSystem
+		case "user":
+			role = entMessage.RoleUser
+		case "assistant":
+			role = entMessage.RoleAssistant
+		case "tool":
+			role = entMessage.RoleTool
+		}
+
+		_, err := sm.entClient.SessionMessage.Create().
+			SetSessionID(sessionID).
+			SetSeq(seq).
+			SetRole(role).
+			SetContent(msg.Content).
+			SetToolCalls(toolCalls).
+			SetToolCallID(msg.ToolCallID).
+			SetCreateTime(now).
+			Save(ctx)
+		if err != nil {
+			// Ignore duplicates (UNIQUE on session_id, seq)
+			slog.Debug("message persist skipped (duplicate)", "session", sessionID, "seq", seq)
+		}
+	}
+	return nil
 }
 
-func (s *Store) DeleteSession(id string) error {
-	tx, _ := s.db.Begin()
-	if tx != nil {
-		tx.Exec("DELETE FROM session_messages WHERE session_id = ?", id)
-		tx.Exec("DELETE FROM sessions WHERE id = ?", id)
-		tx.Commit()
+// onIdleTimeout is called when the heartbeat timer fires.
+func (sm *SessionManager) onIdleTimeout(id string) {
+	s, ok := sm.GetCached(id)
+	if !ok {
+		return
+	}
+	s.SetStatus("idle")
+	s.CloseMCP()
+
+	ctx := context.Background()
+	_, err := sm.entClient.Session.UpdateOneID(id).
+		SetStatus(entSession.StatusIdle).
+		SetUpdateTime(time.Now()).
+		Save(ctx)
+	if err != nil {
+		slog.Error("failed to mark session idle on timeout", "id", id, "error", err)
+		return
+	}
+
+	slog.Info("session marked idle (heartbeat timeout)", "id", id)
+}
+
+// parseArgsMap parses a JSON-encoded arguments string back to a map.
+func parseArgsMap(argsJSON string) map[string]any {
+	if argsJSON == "" {
 		return nil
 	}
-	return fmt.Errorf("failed to begin transaction")
-}
-
-func (s *Store) ListSessions() ([]SessionMeta, error) {
-	rows, err := s.db.Query(
-		"SELECT id, status, mode, user_id, username, business_type, business_id, metadata, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []SessionMeta
-	for rows.Next() {
-		var m SessionMeta
-		var ca, ua int64
-		var metaJSON string
-		if err := rows.Scan(&m.ID, &m.Status, &m.Mode, &m.UserID, &m.Username, &m.BusinessType, &m.BusinessID, &metaJSON, &ca, &ua); err != nil {
-			return nil, err
-		}
-		json.Unmarshal([]byte(metaJSON), &m.Metadata)
-		m.CreatedAt = time.Unix(ca, 0)
-		m.UpdatedAt = time.Unix(ua, 0)
-		out = append(out, m)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) SessionExists(id string) (bool, error) {
-	var exists bool
-	err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?)", id).Scan(&exists)
-	return exists, err
-}
-
-// --- Messages ---
-
-func (s *Store) AppendMessage(sessionID string, seq int, msg *schema.Message) error {
-	toolCallsJSON := "null"
-	if len(msg.ToolCalls) > 0 {
-		b, _ := json.Marshal(msg.ToolCalls)
-		toolCallsJSON = string(b)
-	}
-	toolCallID := "null"
-	if msg.ToolCallID != "" {
-		b, _ := json.Marshal(msg.ToolCallID)
-		toolCallID = string(b)
-	}
-	toolName := "null"
-	if msg.ToolName != "" {
-		b, _ := json.Marshal(msg.ToolName)
-		toolName = string(b)
-	}
-
-	// SQLite doesn't understand Go's "null" string — use raw SQL with proper NULL
-	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO session_messages (session_id, seq, role, content, tool_calls, tool_call_id, tool_name, created_at)
-		 VALUES (?1, ?2, ?3, ?4,
-		         CASE WHEN ?5 = 'null' THEN NULL ELSE ?5 END,
-		         CASE WHEN ?6 = 'null' THEN NULL ELSE ?6 END,
-		         CASE WHEN ?7 = 'null' THEN NULL ELSE ?7 END,
-		         ?8)`,
-		sessionID, seq, string(msg.Role), msg.Content,
-		toolCallsJSON, toolCallID, toolName, time.Now().Unix(),
-	)
-	return err
-}
-
-func (s *Store) LoadMessages(sessionID string) ([]*schema.Message, error) {
-	rows, err := s.db.Query(
-		"SELECT role, content, tool_calls, tool_call_id, tool_name FROM session_messages WHERE session_id = ? ORDER BY seq",
-		sessionID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var msgs []*schema.Message
-	for rows.Next() {
-		var role, content string
-		var tcJSON, tci, tn sql.NullString
-		rows.Scan(&role, &content, &tcJSON, &tci, &tn)
-
-		msg := &schema.Message{
-			Role:    schema.RoleType(role),
-			Content: content,
-		}
-
-		if tcJSON.Valid && tcJSON.String != "" {
-			json.Unmarshal([]byte(tcJSON.String), &msg.ToolCalls)
-		}
-		if tci.Valid && tci.String != "" {
-			_ = json.Unmarshal([]byte(tci.String), &msg.ToolCallID)
-		}
-		if tn.Valid && tn.String != "" {
-			_ = json.Unmarshal([]byte(tn.String), &msg.ToolName)
-		}
-
-		msgs = append(msgs, msg)
-	}
-	return msgs, rows.Err()
+	result := map[string]any{"_raw": argsJSON}
+	return result
 }

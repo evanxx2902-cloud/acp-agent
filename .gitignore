@@ -11,6 +11,9 @@
 # Config with secrets
 /config.json
 
+# Data
+/data/
+
 # OS
 .DS_Store
 /acp

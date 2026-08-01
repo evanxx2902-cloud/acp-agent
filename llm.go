@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"os"
 	"strconv"
 
@@ -11,117 +10,132 @@ import (
 	"github.com/cloudwego/eino-ext/components/model/openai"
 )
 
-// Config holds all configuration for the agent server.
-// Only LLM-related fields are loaded from config.json.
-// Operational fields use code defaults + env var overrides.
-type Config struct {
-	// LLM config (from config.json + env vars)
-	LLMProvider   string `json:"llm_provider"`
-	LLMAPIKey     string `json:"llm_api_key"`
-	LLMBaseURL    string `json:"llm_base_url"`
-	LLMModel      string `json:"llm_model"`
-	ContextWindow int    `json:"context_window"`
+// =========================================================================
+// LLMConfigProvider / ModelInfoProvider interfaces
+// =========================================================================
 
-	// Operational config (code defaults + env vars only, NOT in config.json)
-	SummarizationTrigger float64 // fraction of context window to trigger summarization (0.0-1.0)
-	SystemPrompt         string
-	MaxIterations        int
-	DataDir              string
-	DBPath               string
-	Listen               string
-	LogLevel             string
+type LLMConfig struct {
+	Provider string
+	APIKey   string
+	BaseURL  string
+	Model    string
 }
 
-func DefaultConfig() Config {
-	return Config{
-		LLMProvider:          "openai-compatible",
-		LLMModel:             "gpt-4o",
-		ContextWindow:        131072,
-		SummarizationTrigger: 0.5,
-		SystemPrompt:         "You are a helpful AI assistant.",
-		MaxIterations:        20,
-		Listen:               "stdio",
-		LogLevel:             "info",
+type LLMConfigProvider interface {
+	GetConfig(ctx context.Context) (*LLMConfig, error)
+}
+
+type ModelInfoProvider interface {
+	GetContextWindow(ctx context.Context, model string) (int, error)
+}
+
+// =========================================================================
+// Default implementation: reads from config file + env vars
+// =========================================================================
+
+type DefaultLLMConfigProvider struct {
+	configPath string
+}
+
+func NewDefaultLLMConfigProvider(configPath string) *DefaultLLMConfigProvider {
+	return &DefaultLLMConfigProvider{configPath: configPath}
+}
+
+func (p *DefaultLLMConfigProvider) GetConfig(ctx context.Context) (*LLMConfig, error) {
+	cfg := &LLMConfig{
+		Provider: "openai-compatible",
+		Model:    "gpt-4o",
 	}
-}
 
-func LoadConfig() Config {
-	cfg := DefaultConfig()
-
-	configPath := flag.String("config", "", "Path to JSON config file")
-	flag.Parse()
-
-	if *configPath != "" {
-		data, err := os.ReadFile(*configPath)
-		if err == nil {
-			_ = json.Unmarshal(data, &cfg)
+	// Try loading from JSON config file
+	if p.configPath != "" {
+		if data, err := os.ReadFile(p.configPath); err == nil {
+			var fileCfg struct {
+				LLMProvider string `json:"llm_provider"`
+				LLMAPIKey   string `json:"llm_api_key"`
+				LLMBaseURL  string `json:"llm_base_url"`
+				LLMModel    string `json:"llm_model"`
+			}
+			if json.Unmarshal(data, &fileCfg) == nil {
+				if fileCfg.LLMProvider != "" {
+					cfg.Provider = fileCfg.LLMProvider
+				}
+				if fileCfg.LLMAPIKey != "" {
+					cfg.APIKey = fileCfg.LLMAPIKey
+				}
+				if fileCfg.LLMBaseURL != "" {
+					cfg.BaseURL = fileCfg.LLMBaseURL
+				}
+				if fileCfg.LLMModel != "" {
+					cfg.Model = fileCfg.LLMModel
+				}
+			}
 		}
 	}
 
-	// LLM env vars
+	// Env var overrides
 	if v := os.Getenv("ACP_LLM_PROVIDER"); v != "" {
-		cfg.LLMProvider = v
+		cfg.Provider = v
 	}
 	if v := os.Getenv("ACP_LLM_API_KEY"); v != "" {
-		cfg.LLMAPIKey = v
+		cfg.APIKey = v
 	}
 	if v := os.Getenv("ACP_LLM_BASE_URL"); v != "" {
-		cfg.LLMBaseURL = v
+		cfg.BaseURL = v
 	}
 	if v := os.Getenv("ACP_LLM_MODEL"); v != "" {
-		cfg.LLMModel = v
-	}
-	if v := os.Getenv("ACP_CONTEXT_WINDOW"); v != "" {
-		if n, _ := strconv.Atoi(v); n > 0 {
-			cfg.ContextWindow = n
-		}
+		cfg.Model = v
 	}
 
-	// Operational env vars
-	if v := os.Getenv("ACP_SYSTEM_PROMPT"); v != "" {
-		cfg.SystemPrompt = v
-	}
-	if v := os.Getenv("ACP_SUMMARIZATION_TRIGGER"); v != "" {
-		if f, _ := strconv.ParseFloat(v, 64); f > 0 && f <= 1.0 {
-			cfg.SummarizationTrigger = f
-		}
-	}
-	if v := os.Getenv("ACP_DATA_DIR"); v != "" {
-		cfg.DataDir = v
-	}
-	if v := os.Getenv("ACP_DB_PATH"); v != "" {
-		cfg.DBPath = v
-	}
-	if v := os.Getenv("ACP_LISTEN"); v != "" {
-		cfg.Listen = v
-	}
-	if v := os.Getenv("ACP_LOG_LEVEL"); v != "" {
-		cfg.LogLevel = v
-	}
-
-	if cfg.DataDir == "" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			cfg.DataDir = home + "/.acp-agent"
-		} else {
-			cfg.DataDir = ".acp-agent"
-		}
-	}
-	if cfg.DBPath == "" {
-		cfg.DBPath = cfg.DataDir + "/sessions.db"
-	}
-
-	return cfg
+	return cfg, nil
 }
 
-func NewChatModel(ctx context.Context, cfg Config) (model.ToolCallingChatModel, error) {
-	baseURL := cfg.LLMBaseURL
+// =========================================================================
+// Default ModelInfoProvider
+// =========================================================================
+
+type DefaultModelInfoProvider struct{}
+
+func (p *DefaultModelInfoProvider) GetContextWindow(ctx context.Context, model string) (int, error) {
+	// Default context window, can be overridden by env var
+	if v := os.Getenv("ACP_CONTEXT_WINDOW"); v != "" {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			return n, nil
+		}
+	}
+	// Known model defaults
+	switch model {
+	case "gpt-4o":
+		return 131072, nil
+	case "gpt-4-turbo":
+		return 131072, nil
+	case "gpt-4":
+		return 8192, nil
+	case "gpt-3.5-turbo":
+		return 16385, nil
+	case "deepseek-chat":
+		return 131072, nil
+	case "claude-3-opus":
+		return 200000, nil
+	case "claude-3-sonnet":
+		return 200000, nil
+	default:
+		return 131072, nil
+	}
+}
+
+// =========================================================================
+// NewChatModel creates a chat model from LLM config
+// =========================================================================
+
+func NewChatModel(ctx context.Context, cfg *LLMConfig) (model.ToolCallingChatModel, error) {
+	baseURL := cfg.BaseURL
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
 	return openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  cfg.LLMAPIKey,
+		APIKey:  cfg.APIKey,
 		BaseURL: baseURL,
-		Model:   cfg.LLMModel,
+		Model:   cfg.Model,
 	})
 }

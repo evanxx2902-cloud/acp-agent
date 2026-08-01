@@ -1,0 +1,18 @@
+server:
+  name: agent-server
+  version: "1.0.0"
+
+transport:
+  type: tcp
+  tcp:
+    listen: ":9090"
+  unix:
+    socket: "/var/run/acp.sock"
+
+data:
+  database:
+    driver: sqlite3
+    dsn: file:./data/acp.db?cache=shared&_journal_mode=WAL&_fk=1
+
+log:
+  level: info
