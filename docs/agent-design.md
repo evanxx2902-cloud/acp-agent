@@ -402,7 +402,8 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | (最终) `status` | string | `"completed"` / `"cancelled"` / `"error"` |
 
 **职责：**
-- 验证 Session 必须处于 `active` 状态
+- 验证当前连接持有该 Session（`active` 且属于本连接）
+- 验证 Session 没有正在执行的 prompt（同一 session 同时只能有一个 prompt）
 - 将用户消息追加到 session_messages，追加到 Eino 消息列表
 - 启动 ReAct 推理循环，最多执行 `max_iterations` 轮
 - 工具执行前通过 `RequestPermission` 请求用户授权
@@ -571,9 +572,11 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 
 | 状态 | 含义 | 允许的操作 |
 |------|------|------------|
-| `active` | 会话活跃，正在进行推理或等待用户输入 | prompt, cancel, close, heartbeat, release |
-| `idle` | 会话空闲，MCP 连接已释放，消息历史和 summary 保留在内存 | resume, close |
-| `closed` | 会话已关闭，不可逆终态 | 无 |
+| `active` | 被某个连接独占，允许 prompt。同一 session 同时只能有一个 prompt 在执行 | prompt, cancel, close, heartbeat, release |
+| `idle` | 无连接持有，MCP 已释放，消息和 summary 保留在内存 | resume, close |
+| `closed` | 不可逆终态 | 无 |
+
+> `active` 的独占性：`session/new` 和 `session/resume` 都会将 session 绑定到当前连接。其他连接无法 prompt 一个不属于自己的 active session。
 
 ### 4.2 状态流转图
 
