@@ -20,35 +20,19 @@ Agent Server 是一个基于 ACP（Agent-Client Protocol）协议的多会话 AI
 
 ```
 acp/
-├── cmd/
-│   └── agent-server/
-│       └── main.go              # 启动入口
-├── internal/
-│   ├── server/
-│   │   ├── server.go            # Kratos server 初始化和 Wire 注入
-│   │   └── acp_handler.go       # ACP 协议 JSON-RPC 处理器
-│   ├── agent/
-│   │   ├── agent.go             # Agent 核心，实现 acp.Agent 接口
-│   │   ├── runner.go            # ReAct 推理循环
-│   │   └── callback.go          # Eino 回调（日志、telemetry）
-│   ├── session/
-│   │   ├── manager.go           # SessionManager — 内存缓存 + 生命周期
-│   │   ├── scanner.go           # IdleScanner — 心跳超时检测
-│   │   └── session.go           # 运行时 Session 对象
-│   ├── mcp/
-│   │   ├── manager.go           # MCP 连接管理器
-│   │   └── tool_adapter.go      # MCP Tool → Eino BaseTool 适配器
-│   ├── llm/
-│   │   ├── config.go            # LLM 配置
-│   │   └── factory.go           # ChatModel 工厂
-│   └── middleware/
-│       ├── summarization.go     # 对话摘要中间件
-│       └── plantask.go          # Plan 模式中间件
+├── main.go              # 启动入口 + Kratos 初始化 + Wire 注入
+├── agent.go             # Agent 核心 + ACP 协议 Handler（实现 acp.Agent 接口）
+├── runner.go            # ReAct 推理循环
+├── session.go           # Session 实体 + RuntimeSession + SessionManager
+├── mcp.go               # MCPManager + ToolAdapter + MCPConfig
+├── llm.go               # LLMConfigProvider + ModelInfoProvider + ChatModel 工厂
+├── middleware.go         # 对话摘要 + Plan 模式中间件
+├── callback.go          # Eino 回调（日志、telemetry）
+├── config.go            # Config 结构体 + 加载
 ├── ent/
 │   ├── schema/
 │   │   ├── session.go           # Session 实体定义
 │   │   └── session_message.go   # SessionMessage 实体定义
-│   ├── client.go                # 生成的 Ent Client
 │   └── ...                      # 其他生成文件
 ├── configs/
 │   └── config.yaml              # Kratos 配置文件
@@ -647,106 +631,27 @@ resume       ──► timer = time.AfterFunc(3×interval, onIdle) + 重连 MCP
 ### 5.1 结构体关系全景图
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                         Kratos App                                  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                      Wire (DI)                                │  │
-│  │   Config → EntClient → SessionRepo → SessionManager          │  │
-│  │   Config → LLM Factory → ChatModel                           │  │
-│  │   SessionManager → Agent → ACPHandler → Kratos Server        │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────┐
-│                          Agent                                    │
-│  (实现 acp.Agent + acp.AgentLoader 接口)                           │
-├──────────────────────────────────────────────────────────────────┤
-│  cfg           Config                                             │
-│  llmProvider   LLMConfigProvider  ◄── LLM 配置获取                 │
-│  modelInfo     ModelInfoProvider  ◄── 模型元信息查询               │
-│  sessions      *SessionManager    ◄── 内存缓存 + 生命周期           │
-│  conn          *AgentSideConnection ◄── ACP 协议连接                │
-└───────────────┬──────────────────────────────────────────────────┘
-                │ 管理
-                ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                      SessionManager                               │
-├──────────────────────────────────────────────────────────────────┤
-│  mu        sync.Mutex                                             │
-│  sessions  map[string]*RuntimeSession   ◄── 内存中的活跃会话       │
-│  sessionRepo   *ent.SessionClient       ◄── 持久化                 │
-│  messageRepo   *ent.SessionMessageClient◄── 持久化                 │
-├──────────────────────────────────────────────────────────────────┤
-│  + NewSession(ctx, params) → *RuntimeSession, sessionID           │
-│  + GetCached(id) → *RuntimeSession, bool                           │
-│  + Resume(ctx, id, mcpServers) → *RuntimeSession                  │
-│  + Close(ctx, id)                                                  │
-│  + MarkIdle(ctx, id)                                               │
-│  + List(ctx, filter) → []SessionMeta                              │
-└───────────────┬──────────────────────────────────────────────────┘
-                │ 包含
-                ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                     RuntimeSession                                │
-├──────────────────────────────────────────────────────────────────┤
-│  ID            string                                             │
-│  mu            sync.Mutex                                         │
-│  Status        SessionStatus  (active | idle | closed)            │
-│  Mode              string         (agent | plan)                      │
-│  Summary           string         ◄── 对话摘要（摘要中间件更新）        │
-│  HeartbeatInterval int            ◄── 客户端心跳间隔（秒）              │
-│  SummarizationTriggerRatio float64 ◄── 摘要触发比例                       │
-│  heartbeatTimer    *time.Timer     ◄── 超时=3×interval，到期触发 onIdle  │
-│  Messages          []*schema.Message  ◄── Eino 消息格式               │
-│  Seq               int                                                │
-│  Cancel            context.CancelFunc                                 │
-│  Ctx               context.Context                                    │
-│  MaxIterations int           ◄── 单次推理最大轮次                  │
-│  MCPManager    *MCPManager      ◄── MCP 连接池                    │
-│  CMAgent       *ChatModelAgent  ◄── Eino Agent 实例                │
-│  BusinessMeta  BusinessMeta     ◄── 透传业务元数据                  │
-├──────────────────────────────────────────────────────────────────┤
-│  + AppendMessage(msg)                                              │
-│  + AppendToolResult(toolCallID, result)                            │
-│  + SaveMessages(ctx)                                               │
-│  + UpdateSummary(ctx, summary)                                     │
-│  + BuildAgent(chatModel, mcpTools, mode)                           │
-│  + ResetHeartbeatTimer()                                           │
-│  + StopHeartbeatTimer()                                            │
-│  + IsActive() bool                                                 │
-│  + IsClosed() bool                                                 │
-│  + TransitionStatus(newStatus) error                               │
-└───────────────┬──────────────────────────────────────────────────┘
-                │ 持有
-                ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                      MCPManager                                   │
-├──────────────────────────────────────────────────────────────────┤
-│  Clients  []*MCPClientWrapper    ◄── MCP 客户端列表                │
-│  Tools    []*ToolAdapter         ◄── 适配后的工具列表               │
-├──────────────────────────────────────────────────────────────────┤
-│  + Connect(ctx, servers []MCPConfig) error                        │
-│  + DiscoverTools(ctx) → []*schema.ToolInfo                        │
-│  + Disconnect()                                                    │
-│  + GetTools() → []tool.BaseTool                                   │
-└───────────────┬──────────────────────────────────────────────────┘
-                │ 包含
-                ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                      ToolAdapter                                  │
-│  (实现 eino tool.InvokableTool 接口)                                │
-├──────────────────────────────────────────────────────────────────┤
-│  Info   *schema.ToolInfo                                          │
-│  Client MCPCaller                                                 │
-├──────────────────────────────────────────────────────────────────┤
-│  + Info() → *schema.ToolInfo                                      │
-│  + InvokableRun(ctx, args) → result                               │
-│    - 发送 StartToolCall 通知                                       │
-│    - 请求用户权限 (RequestPermission)                               │
-│    - 执行 MCP 调用                                                  │
-│    - 发送 UpdateToolCall 结果                                      │
-└──────────────────────────────────────────────────────────────────┘
+App
+├── EntClient                 (DB)
+├── LLMConfigProvider         (LLM 配置)
+├── ModelInfoProvider         (模型元信息)
+└── ACPServer                 (stdio / tcp / unix)
+    └── Agent                 (每个连接一个实例，实现 acp.Agent 接口)
+        └── SessionManager    (管理所有 Session)
+            └── RuntimeSession  (每个会话一个实例)
+                ├── ChatModel          (LLM 客户端)
+                ├── MCPManager         (MCP 连接器)
+                │   └── ToolAdapter[]  (MCP Tool → Eino Tool)
+                ├── heartbeatTimer     (每 session 独立定时器)
+                └── Messages[]         (Eino 消息历史)
 ```
+
+**包含关系：**
+- `App` 启动 `ACPServer`，持有 `EntClient`、`LLMConfigProvider`、`ModelInfoProvider`
+- `ACPServer` 每接受一个客户端连接创建一个 `Agent`
+- `Agent` 持有一个 `SessionManager`
+- `SessionManager` 管理多个 `RuntimeSession`（按 session_id 索引）
+- 每个 `RuntimeSession` 包含独立的 `ChatModel`（LLM）、`MCPManager`（工具）、`heartbeatTimer`（心跳超时）、`Messages`（对话历史）
 
 ### 5.2 关键类型定义
 
@@ -764,73 +669,22 @@ type MCPConfig struct {
 }
 ```
 
-### 5.3 Ent 生成的 Repo 层
-
-Ent 通过 schema 定义自动生成类型安全的 Client，我们用它作为 Repository 层：
-
-```go
-// EntClient 持有数据库连接和所有生成的子 Client
-type EntClient = ent.Client   // 由 ent 生成
-
-// 使用方式：
-// client.Session.Query().Where(session.StatusEQ("active")).All(ctx)
-// client.SessionMessage.Query().Where(
-//     sessionmessage.SessionIDEQ(sid),
-//     sessionmessage.SeqGT(lastSeq),
-// ).All(ctx)
-```
-
-无需额外封装 Repository 接口，Ent 生成的 Client 已经提供了完整的 CRUD 操作、查询构建器、事务支持。
-
-### 5.4 依赖注入（Kratos Wire）
-
-```go
-// wire.go
-//go:build wireinject
-// +build wireinject
-
-func InitApp(cfg *conf.Bootstrap) (*App, error) {
-    wire.Build(
-        // 数据库
-        NewEntClient,
-        // LLM 配置（mock 实现）
-        NewLLMConfigProvider,
-        NewModelInfoProvider,
-        // LLM
-        NewChatModel,
-        // MCP
-        mcp.NewManager,
-        // Session
-        session.NewSessionManager,
-        // Agent
-        agent.NewAgent,
-        // Server
-        server.NewACPServer,
-        server.NewACPHandler,
-        // App
-        NewApp,
-    )
-    return &App{}, nil
-}
-```
-
-### 5.5 各结构体职责总结
+### 5.3 各结构体职责总结
 
 | 结构体 | 职责 |
 |--------|------|
 | `App` | 应用程序入口，组合 Kratos Server 生命周期 |
-| `Agent` | 实现 ACP 协议所有方法，编排 LLM + MCP + Session |
-| `SessionManager` | Session 的内存缓存、持久化、List 查询 |
-| `RuntimeSession` | 单个会话的运行时状态、消息列表、心跳定时器、MCP 连接、Eino Agent |
-| `MCPManager` | MCP 客户端列表管理、工具发现、连接生命周期 |
-| `ToolAdapter` | 将 MCP Tool 适配为 Eino InvokableTool，注入权限请求逻辑 |
-| `ACPServer` | 管理 ACP Transport（stdio / TCP / Unix Socket） |
-| `ACPHandler` | JSON-RPC 请求分发，路由到 Agent 对应方法 |
-| `EntClient` | Ent 生成的数据库 Client，作为 Repository 层 |
-| `Config` | 全局配置结构体，通过 Kratos config 加载 |
-| `ChatModel` | OpenAI 兼容的 LLM 适配器，由 Eino factory 创建 |
+| `Agent` | 实现 ACP 协议方法，编排 LLM + MCP + Session |
+| `SessionManager` | Session 内存缓存、持久化、列表查询 |
+| `RuntimeSession` | 单会话运行时状态：消息历史、心跳定时器、MCP 连接、Eino Agent 实例 |
+| `MCPManager` | MCP 客户端生命周期、工具发现 |
+| `ToolAdapter` | MCP Tool → Eino InvokableTool，注入权限请求 |
+| `LLMConfigProvider` | LLM 配置获取接口 |
+| `ModelInfoProvider` | 模型元信息查询接口 |
+| `EntClient` | Ent 生成的 DB Client |
+| `Config` | 全局配置（transport、database、agent 参数） |
 
-### 5.6 接口定义
+### 5.4 接口定义
 
 ```go
 // NewSessionParams 创建会话的参数。
@@ -1086,35 +940,3 @@ type ModelInfoProvider interface {
 
 
 
----
-
-## 9. 迁移计划
-
-从当前单文件 `package main` 架构迁移到上述 Kratos + Ent 架构，分阶段进行：
-
-### Phase 1：基础设施搭建
-- 初始化 Kratos 项目骨架
-- 定义 Ent Schema（Session + SessionMessage）
-- 生成 Ent Client 代码
-- 编写 Kratos 配置文件
-
-### Phase 2：Session 层重构
-- 实现 SessionManager（基于 Ent Client）
-- 实现 RuntimeSession
-- 实现 IdleScanner
-- 将现有 SQL 操作替换为 Ent 调用
-
-### Phase 3：Agent 层重构
-- 提取 Agent 结构体到 internal/agent
-- 实现 ACPHandler（JSON-RPC 路由）
-- 连接 Kratos Transport 层
-
-### Phase 4：MCP/LLM 解耦
-- 提取 MCPManager 到 internal/mcp
-- 提取 LLM 工厂到 internal/llm
-- 提取中间件到 internal/middleware
-
-### Phase 5：Wire 依赖注入
-- 编写 Wire 配置文件
-- 编译时生成 DI 代码
-- 端到端测试
