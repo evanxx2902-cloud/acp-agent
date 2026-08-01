@@ -572,7 +572,7 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 
 | 状态 | 含义 | 允许的操作 |
 |------|------|------------|
-| `active` | 被某个连接独占，允许 prompt。同一 session 同时只能有一个 prompt 在执行 | prompt, cancel, close, heartbeat, release |
+| `active` | 被某个连接独占，禁止同一 session 并发 prompt | prompt, cancel, close, heartbeat, release |
 | `idle` | 无连接持有，MCP 已释放，消息和 summary 保留在内存 | resume, close |
 | `closed` | 不可逆终态 | 无 |
 
@@ -777,6 +777,39 @@ Client                    Agent Server                   DB              MCP Ser
   │                                   │  (状态: idle → active)            │
   │                                   │  ────SessionUpdate(流式)─────────►│
 ```
+
+### 7.4 并发冲突
+
+**跨连接冲突：** A 持有 active session，B 尝试操作。
+
+```
+客户端 A                              Agent Server                       客户端 B
+  │                                      │                                   │
+  │──resume──► (session X: idle→active)   │                                   │
+  │──prompt──► (推理中...)                │                                   │
+  │                                      │    ◄────session/resume────────────│
+  │                                      │    ──{error: session not idle}───►│
+  │                                      │    ◄────session/prompt────────────│
+  │                                      │    ──{error: session not owned}──►│
+  │──_release──►                         │                                   │
+  │                                      │    ◄────session/resume────────────│
+  │                                      │    ──{ok}────────────────────────►│
+```
+
+**同连接并发 prompt：** A 对同一 session 发送两个 prompt。
+
+```
+客户端 A                              Agent Server
+  │                                      │
+  │──prompt(session X)──► (推理中...)     │
+  │──prompt(session X)──►                │
+  │◄──{error: session busy}──────────────│
+  │◄──{completed}──────── (第一个完成)    │
+  │──prompt(session X)──► (可以了)        │
+```
+
+- 跨连接：状态校验 + 归属校验双重拦截
+- 同连接并发：session 级别的 prompt 互斥锁，同一时刻只允许一个 prompt 执行
 
 ---
 
