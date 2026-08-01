@@ -218,37 +218,43 @@ type ToolCall struct {
 ### 2.3 ER 关系图
 
 ```
-┌──────────────────────────────────────┐
-│              Session                 │
-├──────────────────────────────────────┤
-│ id            TEXT PK (UUID v4)      │
-│ status        TEXT (active|idle|closed)│
-│ user_id       INTEGER                │
-│ username      TEXT                   │
-│ business_id   TEXT                   │
-│ business_type TEXT                   │
-│ business_meta JSON                   │
-│ mode          TEXT (agent|plan)      │
-│ heartbeat_interval INTEGER           │
-│ summary       TEXT                   │
-│ create_time   TIMESTAMP              │
-│ update_time   TIMESTAMP              │
-└──────────┬───────────────────────────┘
-           │ 1
-           │
-           │ *
-┌──────────▼───────────────────────────┐
-│          SessionMessage              │
-├──────────────────────────────────────┤
-│ id           INTEGER PK (auto-incr)  │
-│ session_id   TEXT FK → Session       │
-│ seq          INTEGER                 │
-│ role         TEXT (sys|user|asst|tool)│
-│ content      TEXT                    │
-│ tool_calls   JSON                    │
-│ tool_call_id TEXT                    │
-│ create_time  TIMESTAMP               │
-└──────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│                 Session                  │
+├──────────────────────────────────────────┤
+│  id                   TEXT PK (UUID v4)  │
+│  status               TEXT               │
+│  user_id              INTEGER            │
+│  username             TEXT               │
+│  business_id          TEXT               │
+│  business_type        TEXT               │
+│  business_meta        JSON               │
+│  mode                 TEXT               │
+│  heartbeat_interval   INTEGER            │
+│  summary              TEXT               │
+│  create_time          TIMESTAMP          │
+│  update_time          TIMESTAMP          │
+│                                          │
+│  CHECK: status IN ('active','idle','closed')  │
+│  CHECK: mode IN ('agent','plan')         │
+└────────────────┬─────────────────────────┘
+                 │ 1
+                 │
+                 │ *
+┌────────────────▼─────────────────────────┐
+│              SessionMessage              │
+├──────────────────────────────────────────┤
+│  id               INTEGER PK (auto-incr)   │
+│  session_id       TEXT FK → Session      │
+│  seq              INTEGER                │
+│  role             TEXT                   │
+│  content          TEXT                   │
+│  tool_calls       JSON                   │
+│  tool_call_id     TEXT                   │
+│  create_time      TIMESTAMP              │
+│                                          │
+│  UNIQUE: (session_id, seq)               │
+│  CHECK: role IN ('system','user','assistant','tool') │
+└──────────────────────────────────────────┘
 ```
 
 ### 2.4 数据归属
@@ -684,85 +690,6 @@ type MCPConfig struct {
 | `EntClient` | Ent 生成的 DB Client |
 | `Config` | 全局配置（transport、database、agent 参数） |
 
-### 5.4 接口定义
-
-```go
-// NewSessionParams 创建会话的参数。
-type NewSessionParams struct {
-    UserID            int64
-    Username          string
-    BusinessID        string
-    BusinessType      string
-    BusinessMeta      map[string]any
-    Mode              string
-    SystemPrompt      string
-    MaxIterations     int
-    HeartbeatInterval int
-    MCPConfigs        []MCPConfig
-}
-
-// SessionFilter 列表查询条件。
-type SessionFilter struct {
-    UserID       *int64
-    BusinessID   *string
-    BusinessType *string
-    BusinessMeta map[string]any
-    Status       *string
-    PageSize     int
-    PageNumber   int
-}
-
-// ListResult 列表查询结果。
-type ListResult struct {
-    Sessions []*SessionMeta
-    Total    int
-}
-
-// SessionManagerInterface 会话管理器接口。
-type SessionManagerInterface interface {
-    // NewSession 创建会话并返回 RuntimeSession（含 session_id），
-    // 内部处理：写 session + system_prompt 消息到 DB，连 MCP，建 Agent，启定时器，加入缓存。
-    NewSession(ctx context.Context, params NewSessionParams) (*RuntimeSession, error)
-
-    // GetCached 从内存缓存获取会话，不存在返回 false。
-    GetCached(id string) (*RuntimeSession, bool)
-
-    // Resume 从 DB 加载会话和消息历史，重连 MCP，重建 Agent，启定时器，加入缓存。
-    // 仅 idle 状态可用。
-    Resume(ctx context.Context, id string, mcpServers []MCPConfig) (*RuntimeSession, error)
-
-    // Close 停止定时器，断开 MCP，更新 DB 为 closed，从缓存移除。
-    Close(ctx context.Context, id string) error
-
-    // MarkIdle 停止定时器，断开 MCP，更新 DB 为 idle。保留在缓存中。
-    MarkIdle(ctx context.Context, id string) error
-
-    // UpdateSummary 将摘要持久化到 session 表。由摘要中间件触发。
-    UpdateSummary(ctx context.Context, id string, summary string) error
-
-    // List 按条件分页查询会话列表。
-    List(ctx context.Context, filter SessionFilter) (*ListResult, error)
-}
-```
-
-> Session 和 SessionMessage 的 DB CRUD 操作由 Ent 生成的 Client 直接提供（见 5.3 节），SessionManager 内部持有 Ent Client 引用，无需额外定义 Repository 接口。
-
-```go
-// ACPAgent 协议方法接口，由 Agent 实现，ACPHandler 将 JSON-RPC 请求路由到对应方法。
-type ACPAgent interface {
-    Initialize(ctx context.Context, req *acp.InitializeRequest) (*acp.InitializeResponse, error)
-    Authenticate(ctx context.Context, req *acp.AuthenticateRequest) (*acp.AuthenticateResponse, error)
-    NewSession(ctx context.Context, req *acp.NewSessionRequest) (*acp.NewSessionResponse, error)
-    Prompt(ctx context.Context, req *acp.PromptRequest) (*acp.PromptResponse, error)
-    ResumeSession(ctx context.Context, req *acp.ResumeSessionRequest) (*acp.ResumeSessionResponse, error)
-    CloseSession(ctx context.Context, req *acp.CloseSessionRequest) (*acp.CloseSessionResponse, error)
-    ListSessions(ctx context.Context, req *acp.ListSessionsRequest) (*acp.ListSessionsResponse, error)
-    Cancel(ctx context.Context, req *acp.CancelRequest) (*acp.CancelResponse, error)
-    HandleHeartbeat(ctx context.Context, req *acp.HeartbeatRequest) (*acp.HeartbeatResponse, error)
-    HandleRelease(ctx context.Context, req *acp.ReleaseRequest) (*acp.ReleaseResponse, error)
-}
-```
-
 ---
 
 ## 6. 数据库设计
@@ -897,13 +824,11 @@ data:
     driver: sqlite3           # sqlite3 | postgres
     dsn: file:./data/acp.db?cache=shared&_journal_mode=WAL
 
-agent:
-  max_iterations: 50           # 服务端硬上限，session/new 传入值不可超过此值
-  default_max_iterations: 20   # 客户端不传时使用此常量
-
 log:
   level: info
 ```
+
+> `max_iterations` 不通过配置文件设置。代码中定义常量 `DefaultMaxIterations = 20`（客户端不传时使用）和 `MaxIterationsCap = 50`（硬上限，客户端传入值不可超过此值）。
 
 > LLM 配置不在配置文件中。每次 `session/new` 时通过 `LLMConfigProvider` 接口获取，返回 provider、api_key、base_url、model 等信息。模型上下文长度通过 model info API 查询。
 
