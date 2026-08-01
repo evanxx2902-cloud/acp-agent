@@ -589,47 +589,53 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 ### 4.2 状态流转图
 
 ```
-                    ┌──────────────┐
-                    │              │
-     session/new    │    ACTIVE    │◄────────┐
-        ──────────► │              │          │
-                    └───┬────┬────┘          │
-                        │    │               │
-          session/close │    │ _release      │ session/resume
-                        │    │ (heartbeat    │
-                        │    │  timeout)     │
-                        │    │               │
-                        ▼    ▼               │
-                    ┌──────────┐             │
-                    │          │             │
-                    │  CLOSED  │    IDLE     │
-                    │          │─────┼───────┘
-                    └──────────┘     │
-                          ▲          │ session/close
-                          │          │
-                          └──────────┘
-                          (可以从 idle 直接 close)
+                         session/new
+                            │
+                            ▼
+                      ┌──────────┐       session/close
+                      │          │──────────────────────┐
+          ┌──────────►│  ACTIVE  │                      │
+          │           │          │                      │
+          │           └────┬─────┘                      │
+          │                │                            │
+          │                │ _release / heartbeat 超时    │
+          │                │ (断开 MCP，停定时器)          │
+          │                │                            │
+          │                ▼                            ▼
+          │           ┌──────────┐               ┌──────────┐
+          │           │          │ session/close │          │
+          └───────────│   IDLE   │──────────────►│  CLOSED  │
+      session/resume  │          │               │          │
+                      └──────────┘               └──────────┘
 ```
 
 ### 4.3 状态转换表
 
 | 当前状态 | 触发事件 | 目标状态 | 说明 |
 |----------|----------|----------|------|
-| - | `session/new` | `active` | 新建会话，立即激活 |
+| - | `session/new` | `active` | 新建会话，启动心跳定时器 |
 | `active` | `session/prompt` | `active` | 保持活跃，执行推理 |
 | `active` | `session/cancel` | `active` | 取消推理，仍可继续对话 |
-| `active` | `_release` | `idle` | 客户端主动释放控制权 |
-| `active` | heartbeat 超时 | `idle` | IdleScanner 检测到 lastHeartbeat 超过 3×heartbeat_interval |
-| `active` | `session/close` | `closed` | 主动关闭 |
-| `idle` | `session/resume` | `active` | 从 DB 加载会话，恢复 MCP 连接，继续对话 |
-| `idle` | `session/close` | `closed` | 从空闲状态直接关闭 |
+| `active` | `_release` | `idle` | 断开 MCP，停止定时器 |
+| `active` | heartbeat 定时器到期 | `idle` | 超时未收到心跳，断开 MCP |
+| `active` | `session/close` | `closed` | 停止定时器，断开 MCP，清理内存 |
+| `idle` | `session/resume` | `active` | 从 DB 加载，重连 MCP，启动定时器 |
+| `idle` | `session/close` | `closed` | 清理内存 |
 | `closed` | 任何操作 | `closed` | 终态，拒绝所有操作 |
 
-### 4.4 IdleScanner 机制
+### 4.4 心跳超时机制
 
-后台 goroutine 每隔 10 秒扫描所有 `active` Session，检查 `now - lastHeartbeat > 3 × heartbeat_interval`，超过则标记为 idle，断开 MCP 连接，更新 DB 状态。
+每个 `active` Session 持有独立的 `*time.Timer`，超时时间 = `3 × heartbeat_interval`。
 
-扫描时跳过 `idle` 和 `closed` 状态的 Session。
+```
+session/new  ──► timer = time.AfterFunc(3×interval, onIdle)
+_heartbeat   ──► timer.Reset(3×interval)
+_release     ──► timer.Stop() + 断 MCP + 标记 idle
+session/close──► timer.Stop() + 断 MCP + 清内存
+resume       ──► timer = time.AfterFunc(3×interval, onIdle) + 重连 MCP
+```
+
+`onIdle` 回调：标记 Session 为 idle，断开 MCP 连接，更新 DB 状态。各 Session 的定时器独立运行，互不影响。
 
 ---
 
@@ -666,7 +672,6 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 │  sessions  map[string]*RuntimeSession   ◄── 内存中的活跃会话       │
 │  sessionRepo   *ent.SessionClient       ◄── 持久化                 │
 │  messageRepo   *ent.SessionMessageClient◄── 持久化                 │
-│  idleScanner   *IdleScanner                                       │
 ├──────────────────────────────────────────────────────────────────┤
 │  + NewSession(ctx, params) → *RuntimeSession, sessionID           │
 │  + GetCached(id) → *RuntimeSession, bool                           │
@@ -686,11 +691,11 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 │  Mode              string         (agent | plan)                      │
 │  Summary           string         ◄── 对话摘要（摘要中间件更新）        │
 │  HeartbeatInterval int            ◄── 客户端心跳间隔（秒）              │
+│  heartbeatTimer    *time.Timer     ◄── 超时=3×interval，到期触发 onIdle  │
 │  Messages          []*schema.Message  ◄── Eino 消息格式               │
 │  Seq               int                                                │
 │  Cancel            context.CancelFunc                                 │
 │  Ctx               context.Context                                    │
-│  LastHeartbeat     time.Time                                          │
 │  MaxIterations int           ◄── 单次推理最大轮次                  │
 │  MCPManager    *MCPManager      ◄── MCP 连接池                    │
 │  CMAgent       *ChatModelAgent  ◄── Eino Agent 实例                │
@@ -701,6 +706,8 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 │  + SaveMessages(ctx)                                               │
 │  + UpdateSummary(ctx, summary)                                     │
 │  + BuildAgent(chatModel, mcpTools, mode)                           │
+│  + ResetHeartbeatTimer()                                           │
+│  + StopHeartbeatTimer()                                            │
 │  + IsActive() bool                                                 │
 │  + IsClosed() bool                                                 │
 │  + TransitionStatus(newStatus) error                               │
@@ -787,7 +794,6 @@ func InitApp(cfg *conf.Bootstrap) (*App, error) {
         mcp.NewManager,
         // Session
         session.NewSessionManager,
-        session.NewIdleScanner,
         // Agent
         agent.NewAgent,
         // Server
@@ -807,8 +813,7 @@ func InitApp(cfg *conf.Bootstrap) (*App, error) {
 | `App` | 应用程序入口，组合 Kratos Server 生命周期 |
 | `Agent` | 实现 ACP 协议所有方法，编排 LLM + MCP + Session |
 | `SessionManager` | Session 的内存缓存、持久化、List 查询 |
-| `RuntimeSession` | 单个会话的运行时状态、消息列表、MCP 连接、Eino Agent |
-| `IdleScanner` | 后台检测 heartbeat 超时，自动标记 idle |
+| `RuntimeSession` | 单个会话的运行时状态、消息列表、心跳定时器、MCP 连接、Eino Agent |
 | `MCPManager` | MCP 客户端列表管理、工具发现、连接生命周期 |
 | `ToolAdapter` | 将 MCP Tool 适配为 Eino InvokableTool，注入权限请求逻辑 |
 | `ACPServer` | 管理 ACP Transport（stdio / TCP / Unix Socket） |
@@ -841,7 +846,6 @@ type SessionManagerInterface interface {
     Close(ctx context.Context, id string) error
     MarkIdle(ctx context.Context, id string) error
     List(ctx context.Context, filter SessionFilter) ([]*SessionMeta, error)
-    StartIdleScanner(ctx context.Context, interval, timeout time.Duration)
 }
 
 // ACP Handler 接口（由 Agent 实现）
@@ -938,18 +942,17 @@ Client                    Agent Server                   DB              MCP Ser
 
 ### 7.2 Heartbeat 超时自动 Idle
 
-示例：heartbeat_interval = 3s，超时 = 3 × 3 = 9s。
+示例：heartbeat_interval = 3s，定时器超时 = 3 × 3 = 9s。
 
 ```
-时间轴 (秒)：
-  0s ─── Client 发送 _heartbeat ─── lastHeartbeat = now
-  3s ─── Client 发送 _heartbeat ─── lastHeartbeat = now
-  6s ─── Client 发送 _heartbeat ─── lastHeartbeat = now
-  9s ─── Client 断开连接（崩溃/网络故障）
- 10s ─── IdleScanner 扫描 ───────── lastHeartbeat = 6s，距 now 仅 4s，未超 9s，不处理
- 13s ─── IdleScanner 扫描 ───────── lastHeartbeat = 6s，now = 13s，超过 9s
-                                     → 标记为 idle，断开 MCP，更新 DB
- 16s ─── Client 重连，session/resume → 重新连接 MCP，状态恢复为 active
+时间轴：
+  0.0s ─── Client 发送 _heartbeat ─── timer.Reset(9s)
+  3.0s ─── Client 发送 _heartbeat ─── timer.Reset(9s)
+  6.0s ─── Client 发送 _heartbeat ─── timer.Reset(9s)
+  9.0s ─── Client 崩溃，不再发心跳
+ 15.0s ─── timer 到期（距上次 Reset 已过 9s）
+           → onIdle 回调：标记 idle，断开 MCP，更新 DB
+ 16.0s ─── Client 重连，session/resume → 重连 MCP，timer = AfterFunc(9s)，恢复 active
 ```
 
 ### 7.3 优雅释放与恢复
@@ -1008,9 +1011,6 @@ agent:
 summarization:
   enabled: true
   trigger_ratio: 0.8           # 达到 context_window 的 80% 时触发摘要
-
-idle_scanner:
-  scan_interval: 10s
 
 log:
   level: info
