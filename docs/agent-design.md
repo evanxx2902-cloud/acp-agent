@@ -370,6 +370,7 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `system_prompt` | string | 否 | 系统提示词，持久化为 session_messages 第一条记录（seq=0, role=system），创建后不可变 |
 | `max_iterations` | int | 否 | 单次推理最大轮次，默认 `20`，不可超过服务端硬上限 |
 | `heartbeat_interval` | int | 否 | 客户端心跳间隔（秒），默认 10。服务端超时时间 = 3 × heartbeat_interval |
+| `summarization_trigger_ratio` | float64 | 否 | 摘要触发比例，默认 `0.8`。当前 token 数超过 `context_window × ratio` 时触发 |
 | `business_id` | string | 否 | 业务上下文标识 |
 | `business_type` | string | 否 | 业务上下文类型 |
 | `business_meta` | object | 否 | 扩展业务元数据 |
@@ -382,6 +383,8 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `status` | string | `"active"` |
 
 **职责：**
+- 调用 `LLMConfigProvider.GetConfig()` 获取 LLM 配置
+- 调用 `ModelInfoProvider.GetContextWindow()` 获取上下文长度
 - 服务端生成 `session_id`
 - 创建 Session 数据库记录，`system_prompt` 作为 session_messages 的第一条消息（seq=0）持久化
 - 连接客户端声明的 MCP Server，发现并注册工具
@@ -658,10 +661,11 @@ resume       ──► timer = time.AfterFunc(3×interval, onIdle) + 重连 MCP
 │                          Agent                                    │
 │  (实现 acp.Agent + acp.AgentLoader 接口)                           │
 ├──────────────────────────────────────────────────────────────────┤
-│  cfg       Config                                                 │
-│  chatModel ToolCallingChatModel  ◄── LLM Factory 创建             │
-│  sessions  *SessionManager       ◄── 内存缓存 + 生命周期           │
-│  conn      *AgentSideConnection  ◄── ACP 协议连接                  │
+│  cfg           Config                                             │
+│  llmProvider   LLMConfigProvider  ◄── LLM 配置获取                 │
+│  modelInfo     ModelInfoProvider  ◄── 模型元信息查询               │
+│  sessions      *SessionManager    ◄── 内存缓存 + 生命周期           │
+│  conn          *AgentSideConnection ◄── ACP 协议连接                │
 └───────────────┬──────────────────────────────────────────────────┘
                 │ 管理
                 ▼
@@ -691,6 +695,7 @@ resume       ──► timer = time.AfterFunc(3×interval, onIdle) + 重连 MCP
 │  Mode              string         (agent | plan)                      │
 │  Summary           string         ◄── 对话摘要（摘要中间件更新）        │
 │  HeartbeatInterval int            ◄── 客户端心跳间隔（秒）              │
+│  SummarizationTriggerRatio float64 ◄── 摘要触发比例                       │
 │  heartbeatTimer    *time.Timer     ◄── 超时=3×interval，到期触发 onIdle  │
 │  Messages          []*schema.Message  ◄── Eino 消息格式               │
 │  Seq               int                                                │
@@ -788,6 +793,9 @@ func InitApp(cfg *conf.Bootstrap) (*App, error) {
     wire.Build(
         // 数据库
         NewEntClient,
+        // LLM 配置（mock 实现）
+        NewLLMConfigProvider,
+        NewModelInfoProvider,
         // LLM
         NewChatModel,
         // MCP
@@ -825,30 +833,68 @@ func InitApp(cfg *conf.Bootstrap) (*App, error) {
 ### 5.6 接口定义
 
 ```go
-// SessionManager 的公共接口
-type SessionStore interface {
-    Create(ctx context.Context, s *SessionMeta) error
-    UpdateStatus(ctx context.Context, id string, status SessionStatus) error
-    UpdateHeartbeat(ctx context.Context, id string, t time.Time) error
-    Get(ctx context.Context, id string) (*SessionMeta, error)
-    List(ctx context.Context, filter SessionFilter) ([]*SessionMeta, error)
+// NewSessionParams 创建会话的参数。
+type NewSessionParams struct {
+    UserID            int64
+    Username          string
+    BusinessID        string
+    BusinessType      string
+    BusinessMeta      map[string]any
+    Mode              string
+    SystemPrompt      string
+    MaxIterations     int
+    HeartbeatInterval int
+    MCPConfigs        []MCPConfig
 }
 
-type MessageStore interface {
-    Append(ctx context.Context, msg *MessageRecord) error
-    LoadBySession(ctx context.Context, sessionID string, afterSeq int) ([]*MessageRecord, error)
+// SessionFilter 列表查询条件。
+type SessionFilter struct {
+    UserID       *int64
+    BusinessID   *string
+    BusinessType *string
+    BusinessMeta map[string]any
+    Status       *string
+    PageSize     int
+    PageNumber   int
 }
 
+// ListResult 列表查询结果。
+type ListResult struct {
+    Sessions []*SessionMeta
+    Total    int
+}
+
+// SessionManagerInterface 会话管理器接口。
 type SessionManagerInterface interface {
-    NewSession(ctx context.Context, params NewSessionParams) (*RuntimeSession, string, error)
-    GetCached(id string) (*RuntimeSession, bool)
-    Resume(ctx context.Context, id string, mcpServers []MCPConfig) (*RuntimeSession, error)
-    Close(ctx context.Context, id string) error
-    MarkIdle(ctx context.Context, id string) error
-    List(ctx context.Context, filter SessionFilter) ([]*SessionMeta, error)
-}
+    // NewSession 创建会话并返回 RuntimeSession（含 session_id），
+    // 内部处理：写 session + system_prompt 消息到 DB，连 MCP，建 Agent，启定时器，加入缓存。
+    NewSession(ctx context.Context, params NewSessionParams) (*RuntimeSession, error)
 
-// ACP Handler 接口（由 Agent 实现）
+    // GetCached 从内存缓存获取会话，不存在返回 false。
+    GetCached(id string) (*RuntimeSession, bool)
+
+    // Resume 从 DB 加载会话和消息历史，重连 MCP，重建 Agent，启定时器，加入缓存。
+    // 仅 idle 状态可用。
+    Resume(ctx context.Context, id string, mcpServers []MCPConfig) (*RuntimeSession, error)
+
+    // Close 停止定时器，断开 MCP，更新 DB 为 closed，从缓存移除。
+    Close(ctx context.Context, id string) error
+
+    // MarkIdle 停止定时器，断开 MCP，更新 DB 为 idle。保留在缓存中。
+    MarkIdle(ctx context.Context, id string) error
+
+    // UpdateSummary 将摘要持久化到 session 表。由摘要中间件触发。
+    UpdateSummary(ctx context.Context, id string, summary string) error
+
+    // List 按条件分页查询会话列表。
+    List(ctx context.Context, filter SessionFilter) (*ListResult, error)
+}
+```
+
+> Session 和 SessionMessage 的 DB CRUD 操作由 Ent 生成的 Client 直接提供（见 5.3 节），SessionManager 内部持有 Ent Client 引用，无需额外定义 Repository 接口。
+
+```go
+// ACPAgent 协议方法接口，由 Agent 实现，ACPHandler 将 JSON-RPC 请求路由到对应方法。
 type ACPAgent interface {
     Initialize(ctx context.Context, req *acp.InitializeRequest) (*acp.InitializeResponse, error)
     Authenticate(ctx context.Context, req *acp.AuthenticateRequest) (*acp.AuthenticateResponse, error)
@@ -997,24 +1043,48 @@ data:
     driver: sqlite3           # sqlite3 | postgres
     dsn: file:./data/acp.db?cache=shared&_journal_mode=WAL
 
-llm:
-  provider: openai
-  api_key: ${LLM_API_KEY}     # 环境变量
-  base_url: https://api.openai.com/v1
-  model: gpt-4o
-  context_window: 128000
-  max_iterations: 50           # 服务端硬上限，session/new 传入的值不可超过此值
-
 agent:
-  default_max_iterations: 20   # 常量 DefaultMaxIterations，session/new 不传时使用此值
-
-summarization:
-  enabled: true
-  trigger_ratio: 0.8           # 达到 context_window 的 80% 时触发摘要
+  max_iterations: 50           # 服务端硬上限，session/new 传入值不可超过此值
+  default_max_iterations: 20   # 客户端不传时使用此常量
 
 log:
   level: info
 ```
+
+> LLM 配置不在配置文件中。每次 `session/new` 时通过 `LLMConfigProvider` 接口获取，返回 provider、api_key、base_url、model 等信息。模型上下文长度通过 model info API 查询。
+
+### 8.1 LLMConfigProvider 接口
+
+```go
+// LLMConfigProvider 提供 LLM 配置，每次 session/new 时调用。
+// 实现可以是：读配置文件、调用远程 API、从环境变量获取等。
+type LLMConfigProvider interface {
+    GetConfig(ctx context.Context) (*LLMConfig, error)
+}
+
+type LLMConfig struct {
+    Provider string // 目前仅支持 "openai"
+    APIKey   string
+    BaseURL  string // e.g. "https://api.openai.com/v1"
+    Model    string // e.g. "gpt-4o"
+}
+
+// ModelInfoProvider 查询模型元信息（上下文长度等）。
+type ModelInfoProvider interface {
+    GetContextWindow(ctx context.Context, model string) (int, error)
+}
+```
+
+`ModelInfoProvider` 可通过 OpenAI `/v1/models/{model}` 或其他 LLM provider 的 API 获取上下文窗口大小，用于摘要计算。
+
+### 8.2 摘要触发
+
+摘要始终开启。触发条件：`当前 token 数 > context_window × summarization_trigger_ratio`。
+
+- `context_window`：由 `ModelInfoProvider.GetContextWindow()` 获取
+- `summarization_trigger_ratio`：由客户端在 `session/new` 时传入，默认 `0.8`（80%）
+
+
 
 ---
 
