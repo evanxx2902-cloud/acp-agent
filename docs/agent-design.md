@@ -47,7 +47,6 @@ acp/
 ### 2.1 Session 实体
 
 ```go
-// ent/schema/session.go
 package schema
 
 import (
@@ -57,7 +56,6 @@ import (
     "entgo.io/ent/schema/index"
 )
 
-// Session holds the session entity definition.
 type Session struct {
     ent.Schema
 }
@@ -133,7 +131,6 @@ func (Session) Indexes() []ent.Index {
 ### 2.2 SessionMessage 实体
 
 ```go
-// ent/schema/session_message.go
 package schema
 
 import (
@@ -144,7 +141,6 @@ import (
     "entgo.io/ent/schema/index"
 )
 
-// SessionMessage holds a single message in a session conversation.
 type SessionMessage struct {
     ent.Schema
 }
@@ -211,7 +207,7 @@ type ToolCall struct {
     ID        string         `json:"id"`
     Name      string         `json:"name"`
     Arguments map[string]any `json:"arguments"`
-    Result    string         `json:"result,omitempty"` // lightweight summary
+    Result    string         `json:"result,omitempty"`
 }
 ```
 
@@ -638,63 +634,40 @@ resume       ──► timer = time.AfterFunc(3×interval, onIdle) + 重连 MCP
 
 ```
 App
-├── EntClient                 (DB)
-├── LLMConfigProvider         (LLM 配置)
-├── ModelInfoProvider         (模型元信息)
-└── ACPServer                 (stdio / tcp / unix)
-    └── Agent                 (每个连接一个实例，实现 acp.Agent 接口)
-        └── SessionManager    (管理所有 Session)
-            └── RuntimeSession  (每个会话一个实例)
-                ├── ChatModel          (LLM 客户端)
-                ├── MCPManager         (MCP 连接器)
-                │   └── ToolAdapter[]  (MCP Tool → Eino Tool)
-                ├── heartbeatTimer     (每 session 独立定时器)
-                └── Messages[]         (Eino 消息历史)
+├── EntClient
+├── ACPServer
+│   └── Agent
+└── SessionManager
+    └── RuntimeSession
+        ├── ChatModel
+        ├── MCPManager
+        │   └── ToolAdapter
+        ├── heartbeatTimer
+        └── Messages
 ```
 
-**包含关系：**
-- `App` 启动 `ACPServer`，持有 `EntClient`、`LLMConfigProvider`、`ModelInfoProvider`
-- `ACPServer` 每接受一个客户端连接创建一个 `Agent`
-- `Agent` 持有一个 `SessionManager`
-- `SessionManager` 管理多个 `RuntimeSession`（按 session_id 索引）
-- 每个 `RuntimeSession` 包含独立的 `ChatModel`（LLM）、`MCPManager`（工具）、`heartbeatTimer`（心跳超时）、`Messages`（对话历史）
+- `ACPServer` 每接受一个连接创建 `Agent`，`Agent` 实现 `acp.Agent` 接口
+- `SessionManager` 是全局的，管理所有 Agent 的所有 Session
+- 每个 `RuntimeSession` 对应一个会话，持有独立的 LLM 客户端、MCP 连接、心跳定时器、消息历史
 
-### 5.2 关键类型定义
-
-```go
-// MCPConfig 描述一个 MCP 服务器的连接方式（客户端在 new/load/resume 时传入）。
-// 该结构体不在 Ent Schema 中持久化，由客户端每次请求携带。
-type MCPConfig struct {
-    Name    string            `json:"name"`
-    Command string            `json:"command,omitempty"`   // stdio 模式
-    Args    []string          `json:"args,omitempty"`      // stdio 模式
-    Env     map[string]string `json:"env,omitempty"`       // stdio 模式
-    URL     string            `json:"url,omitempty"`        // sse / streamable_http 模式
-    Headers map[string]string `json:"headers,omitempty"`   // sse / streamable_http 模式
-    Type    string            `json:"type"`                 // "stdio" | "sse" | "streamable_http"
-}
-```
-
-### 5.3 各结构体职责总结
+### 5.2 各结构体职责总结
 
 | 结构体 | 职责 |
 |--------|------|
-| `App` | 应用程序入口，组合 Kratos Server 生命周期 |
-| `Agent` | 实现 ACP 协议方法，编排 LLM + MCP + Session |
-| `SessionManager` | Session 内存缓存、持久化、列表查询 |
-| `RuntimeSession` | 单会话运行时状态：消息历史、心跳定时器、MCP 连接、Eino Agent 实例 |
+| `App` | 启动入口，组装依赖 |
+| `ACPServer` | 管理 ACP transport，接收客户端连接，创建 Agent |
+| `Agent` | 处理单个 ACP 连接的协议方法 |
+| `SessionManager` | 全局 Session 内存缓存、持久化、列表查询 |
+| `RuntimeSession` | 单会话运行时：消息历史、心跳定时器、MCP 连接、LLM 客户端 |
 | `MCPManager` | MCP 客户端生命周期、工具发现 |
-| `ToolAdapter` | MCP Tool → Eino InvokableTool，注入权限请求 |
-| `LLMConfigProvider` | LLM 配置获取接口 |
-| `ModelInfoProvider` | 模型元信息查询接口 |
-| `EntClient` | Ent 生成的 DB Client |
-| `Config` | 全局配置（transport、database、agent 参数） |
+| `ToolAdapter` | MCP Tool → Eino InvokableTool |
+| `EntClient` | DB Client |
 
 ---
 
 ## 6. 数据库设计
 
-### 6.1 建表语句（参考，由 Ent 自动生成迁移）
+### 6.1 建表语句
 
 ```sql
 CREATE TABLE sessions (
@@ -807,13 +780,12 @@ Client                    Agent Server                   DB              MCP Ser
 ## 8. 配置设计
 
 ```yaml
-# configs/config.yaml
 server:
   name: agent-server
   version: "1.0.0"
 
 transport:
-  type: tcp          # stdio | tcp | unix
+  type: tcp
   tcp:
     listen: ":9090"
   unix:
@@ -821,47 +793,35 @@ transport:
 
 data:
   database:
-    driver: sqlite3           # sqlite3 | postgres
+    driver: sqlite3
     dsn: file:./data/acp.db?cache=shared&_journal_mode=WAL
 
 log:
   level: info
 ```
 
-> `max_iterations` 不通过配置文件设置。代码中定义常量 `DefaultMaxIterations = 20`（客户端不传时使用）和 `MaxIterationsCap = 50`（硬上限，客户端传入值不可超过此值）。
-
-> LLM 配置不在配置文件中。每次 `session/new` 时通过 `LLMConfigProvider` 接口获取，返回 provider、api_key、base_url、model 等信息。模型上下文长度通过 model info API 查询。
-
 ### 8.1 LLMConfigProvider 接口
 
 ```go
-// LLMConfigProvider 提供 LLM 配置，每次 session/new 时调用。
-// 实现可以是：读配置文件、调用远程 API、从环境变量获取等。
 type LLMConfigProvider interface {
     GetConfig(ctx context.Context) (*LLMConfig, error)
 }
 
 type LLMConfig struct {
-    Provider string // 目前仅支持 "openai"
+    Provider string
     APIKey   string
-    BaseURL  string // e.g. "https://api.openai.com/v1"
-    Model    string // e.g. "gpt-4o"
+    BaseURL  string
+    Model    string
 }
 
-// ModelInfoProvider 查询模型元信息（上下文长度等）。
 type ModelInfoProvider interface {
     GetContextWindow(ctx context.Context, model string) (int, error)
 }
 ```
-
-`ModelInfoProvider` 可通过 OpenAI `/v1/models/{model}` 或其他 LLM provider 的 API 获取上下文窗口大小，用于摘要计算。
 
 ### 8.2 摘要触发
 
 摘要始终开启。触发条件：`当前 token 数 > context_window × summarization_trigger_ratio`。
 
 - `context_window`：由 `ModelInfoProvider.GetContextWindow()` 获取
-- `summarization_trigger_ratio`：由客户端在 `session/new` 时传入，默认 `0.8`（80%）
-
-
-
+- `summarization_trigger_ratio`：由客户端在 `session/new` 时传入，默认 `0.8`
