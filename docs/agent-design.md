@@ -116,6 +116,10 @@ func (Session) Fields() []ent.Field {
             Immutable().
             Comment("Execution mode: agent | plan. Immutable after creation."),
 
+        field.Int("heartbeat_interval").
+            Default(10).
+            Comment("Client heartbeat interval in seconds, server timeout = 3x this value"),
+
         field.Text("summary").
             Optional().
             Default("").
@@ -241,6 +245,7 @@ type ToolCall struct {
 │ business_type TEXT                   │
 │ business_meta JSON                   │
 │ mode          TEXT (agent|plan)      │
+│ heartbeat_interval INTEGER           │
 │ summary       TEXT                   │
 │ create_time   TIMESTAMP              │
 │ update_time   TIMESTAMP              │
@@ -262,32 +267,27 @@ type ToolCall struct {
 └──────────────────────────────────────┘
 ```
 
-### 2.4 数据归属设计说明
+### 2.4 数据归属
 
-**存储在 Session 表的数据**是会话的「身份」和「状态」——无论客户端是谁，这些信息在 load/resume 时都必须恢复：
+**Session 表持久化的字段：**
 
-| 字段 | 原因 |
+| 字段 | 说明 |
 |------|------|
-| `id`, `status`, `mode` | 会话核心状态 |
-| `user_id`, `username` | 会话归属，list 查询维度 |
-| `business_id`, `business_type`, `business_meta` | 业务上下文，list 查询维度 |
-| `summary` | 长对话的压缩状态，摘要中间件触发后更新，resume 时替代被裁剪的历史消息 |
+| `id`, `status`, `mode` | 会话核心标识和状态 |
+| `user_id`, `username` | 会话归属 |
+| `business_id`, `business_type`, `business_meta` | 业务上下文 |
+| `heartbeat_interval` | 客户端声明的心跳间隔，服务端据此计算超时（3x） |
+| `summary` | 对话摘要 |
 
-> `system_prompt` 不单独存字段——`session/new` 时作为 `session_messages` 表的第一条记录（seq=0, role=system）持久化。resume 时从消息历史中自然恢复。
+**每次请求由客户端携带的数据：**
 
-**不存储在 Session 表，由客户端每次请求携带的数据**——这些是「连接配置」，随客户端环境变化：
+| 数据 | 携带接口 |
+|------|----------|
+| `mcp_servers` | session/new, session/resume |
 
-| 数据 | 携带接口 | 原因 |
-|------|----------|------|
-| `mcp_servers` | session/new, session/resume | MCP 服务器的地址、命令、凭据由客户端掌握，服务端不应假设 MCP 配置不变（客户端可能切换网络、更换凭据） |
+> `system_prompt` 不存 session 表——`session/new` 时作为 `session_messages` 第一条记录（seq=0, role=system）持久化。
 
-**SessionMessage 表字段取舍**：
 
-| 字段 | 保留？ | 原因 |
-|------|--------|------|
-| `tool_call_id` | 是 | role=tool 时，LLM 必须通过此字段将工具结果匹配到对应的 tool call |
-| `tool_name` | 否 | 冗余字段，可从同 session 中前一条 assistant 消息的 `tool_calls` JSON 中反查 `name` |
-| `tool_calls` | 是 | role=assistant 时存储完整工具调用信息（id, name, arguments, result 摘要） |
 
 
 
@@ -349,17 +349,11 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 |------|------|------|------|
 | `credential` | string | 是 | 认证凭据（token / API key） |
 
-**响应字段：**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `user_id` | int64 | 用户唯一 ID |
-| `username` | string | 用户名 |
+**响应：** 空对象 `{}`，认证成功。失败返回 JSON-RPC error。
 
 **职责：**
 - 验证客户端凭据
-- 建立认证上下文，后续请求均在此认证下执行
-- 返回用户身份信息
+- 建立认证上下文，后续请求均在认证上下文中执行
 
 ---
 
@@ -374,7 +368,8 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `mcp_servers` | MCPConfig[] | 是 | MCP 服务器连接配置列表 |
 | `mode` | string | 否 | 执行模式：`"agent"`（默认）或 `"plan"`，创建后不可变 |
 | `system_prompt` | string | 否 | 系统提示词，持久化为 session_messages 第一条记录（seq=0, role=system），创建后不可变 |
-| `max_iterations` | int | 否 | 单次推理最大轮次，默认 `20`（常量 `DefaultMaxIterations`），不可超过服务端硬上限 |
+| `max_iterations` | int | 否 | 单次推理最大轮次，默认 `20`，不可超过服务端硬上限 |
+| `heartbeat_interval` | int | 否 | 客户端心跳间隔（秒），默认 10。服务端超时时间 = 3 × heartbeat_interval |
 | `business_id` | string | 否 | 业务上下文标识 |
 | `business_type` | string | 否 | 业务上下文类型 |
 | `business_meta` | object | 否 | 扩展业务元数据 |
@@ -487,16 +482,17 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `user_id` | int64 | 否 | 按用户过滤 |
 | `business_id` | string | 否 | 按业务标识过滤 |
 | `business_type` | string | 否 | 按业务类型过滤 |
+| `business_meta` | object | 否 | 按 business_meta 中的 key-value 过滤，如 `{"project": "acp"}` |
 | `status` | string | 否 | 按状态过滤 |
-| `cursor` | string | 否 | 分页游标，首次不传 |
-| `limit` | int | 否 | 每页条数，默认 20 |
+| `page_size` | int | 否 | 每页条数，默认 20 |
+| `page_number` | int | 否 | 页码，从 1 开始，默认 1 |
 
 **响应字段：**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `sessions` | SessionMeta[] | 会话摘要列表 |
-| `next_cursor` | string | 下一页游标，为空表示已到末尾 |
+| `total` | int | 符合条件的记录总数 |
 
 每条 `SessionMeta`：
 
@@ -509,13 +505,15 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `username` | string | 所属用户名 |
 | `business_id` | string | 业务标识 |
 | `business_type` | string | 业务类型 |
+| `business_meta` | object | 业务元数据 |
 | `message_count` | int | 消息总数（不含 system prompt） |
 | `create_time` | string | 创建时间 |
 | `update_time` | string | 最后更新时间 |
 
 **职责：**
-- 根据过滤条件查询会话列表
-- 游标分页，按 `update_time DESC` 排序
+- 支持多条件 AND 过滤；`business_meta` 过滤使用 JSON 字段匹配（SQLite: `json_extract`, PostgreSQL: `->>`）
+- 分页查询，按 `update_time DESC` 排序
+- 返回 `total` 供前端计算总页数
 - 不返回消息详情
 
 ---
@@ -554,7 +552,7 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 **职责：**
 - 仅对 `active` 状态的 Session 生效
 - 更新内存中的 `lastHeartbeat` 时间戳
-- 客户端建议每 10 秒发送一次
+- 客户端建议每 3 秒发送一次
 
 ---
 
@@ -572,9 +570,9 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 
 **职责：**
 - 如果 Session 是 `active`，标记为 `idle` 并更新 DB
+- 断开所有 MCP 连接（idle 状态的 Session 不保留 MCP 连接）
+- 保留 RuntimeSession 在内存中（含消息历史和 summary），MCPManager 置空
 - 如果已经是 `closed`，忽略
-- 不关闭 MCP 连接，保留内存状态供后续 resume
-- 与 heartbeat 超时的效果相同，但由客户端主动触发
 
 ---
 
@@ -585,7 +583,7 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | 状态 | 含义 | 允许的操作 |
 |------|------|------------|
 | `active` | 会话活跃，正在进行推理或等待用户输入 | prompt, cancel, close, heartbeat, release |
-| `idle` | 会话空闲，客户端已断开但服务端保留资源 | resume, close |
+| `idle` | 会话空闲，MCP 连接已释放，消息历史和 summary 保留在内存 | resume, close |
 | `closed` | 会话已关闭，不可逆终态 | 无 |
 
 ### 4.2 状态流转图
@@ -621,7 +619,7 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `active` | `session/prompt` | `active` | 保持活跃，执行推理 |
 | `active` | `session/cancel` | `active` | 取消推理，仍可继续对话 |
 | `active` | `_release` | `idle` | 客户端主动释放控制权 |
-| `active` | heartbeat 超时 (30s) | `idle` | IdleScanner 自动标记 |
+| `active` | heartbeat 超时 | `idle` | IdleScanner 检测到 lastHeartbeat 超过 3×heartbeat_interval |
 | `active` | `session/close` | `closed` | 主动关闭 |
 | `idle` | `session/resume` | `active` | 从 DB 加载会话，恢复 MCP 连接，继续对话 |
 | `idle` | `session/close` | `closed` | 从空闲状态直接关闭 |
@@ -629,18 +627,9 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 
 ### 4.4 IdleScanner 机制
 
-```
-┌──────────────┐     每 15 秒扫描      ┌──────────────────────────┐
-│  Background   │─────────────────────► │ 遍历所有 active Session   │
-│  Goroutine    │                       │ 检查 lastHeartbeat        │
-│  (ticker)     │◄──────────────────────│ 超过 30s 则标记为 idle     │
-└──────────────┘                       └──────────────────────────┘
-```
+后台 goroutine 每隔 10 秒扫描所有 `active` Session，检查 `now - lastHeartbeat > 3 × heartbeat_interval`，超过则标记为 idle，断开 MCP 连接，更新 DB 状态。
 
-- 扫描间隔：15 秒
-- 超时阈值：30 秒（最多两次扫描即可检测到超时）
-- 扫描时跳过 `idle` 和 `closed` 状态的 Session
-- 标记为 idle 后同时更新数据库中的状态字段
+扫描时跳过 `idle` 和 `closed` 状态的 Session。
 
 ---
 
@@ -694,13 +683,14 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 │  ID            string                                             │
 │  mu            sync.Mutex                                         │
 │  Status        SessionStatus  (active | idle | closed)            │
-│  Mode          string         (agent | plan)                      │
-│  Summary       string         ◄── 对话摘要（摘要中间件更新）        │
-│  Messages      []*schema.Message  ◄── Eino 消息格式               │
-│  Seq           int                                                │
-│  Cancel        context.CancelFunc                                 │
-│  Ctx           context.Context                                    │
-│  LastHeartbeat time.Time                                          │
+│  Mode              string         (agent | plan)                      │
+│  Summary           string         ◄── 对话摘要（摘要中间件更新）        │
+│  HeartbeatInterval int            ◄── 客户端心跳间隔（秒）              │
+│  Messages          []*schema.Message  ◄── Eino 消息格式               │
+│  Seq               int                                                │
+│  Cancel            context.CancelFunc                                 │
+│  Ctx               context.Context                                    │
+│  LastHeartbeat     time.Time                                          │
 │  MaxIterations int           ◄── 单次推理最大轮次                  │
 │  MCPManager    *MCPManager      ◄── MCP 连接池                    │
 │  CMAgent       *ChatModelAgent  ◄── Eino Agent 实例                │
@@ -884,8 +874,9 @@ CREATE TABLE sessions (
     business_id   TEXT DEFAULT '',
     business_type TEXT DEFAULT '',
     business_meta JSON DEFAULT '{}',
-    mode          TEXT NOT NULL DEFAULT 'agent' CHECK (mode IN ('agent', 'plan')),
-    summary       TEXT DEFAULT '',
+    mode               TEXT NOT NULL DEFAULT 'agent' CHECK (mode IN ('agent', 'plan')),
+    heartbeat_interval INTEGER NOT NULL DEFAULT 10,
+    summary            TEXT DEFAULT '',
     create_time   DATETIME NOT NULL,
     update_time   DATETIME NOT NULL
 );
@@ -947,15 +938,18 @@ Client                    Agent Server                   DB              MCP Ser
 
 ### 7.2 Heartbeat 超时自动 Idle
 
+示例：heartbeat_interval = 3s，超时 = 3 × 3 = 9s。
+
 ```
 时间轴 (秒)：
   0s ─── Client 发送 _heartbeat ─── lastHeartbeat = now
- 10s ─── Client 发送 _heartbeat ─── lastHeartbeat = now
- 20s ─── Client 断开连接（崩溃/网络故障）
- 30s ─── IdleScanner 扫描 ───────── lastHeartbeat 仍在 20s 内，不处理
- 45s ─── IdleScanner 扫描 ───────── lastHeartbeat = 20s，now = 45s，超过 30s
-                                     → 标记为 idle，更新 DB
- 55s ─── Client 重连，session/resume → 状态恢复为 active
+  3s ─── Client 发送 _heartbeat ─── lastHeartbeat = now
+  6s ─── Client 发送 _heartbeat ─── lastHeartbeat = now
+  9s ─── Client 断开连接（崩溃/网络故障）
+ 10s ─── IdleScanner 扫描 ───────── lastHeartbeat = 6s，距 now 仅 4s，未超 9s，不处理
+ 13s ─── IdleScanner 扫描 ───────── lastHeartbeat = 6s，now = 13s，超过 9s
+                                     → 标记为 idle，断开 MCP，更新 DB
+ 16s ─── Client 重连，session/resume → 重新连接 MCP，状态恢复为 active
 ```
 
 ### 7.3 优雅释放与恢复
@@ -1015,9 +1009,8 @@ summarization:
   enabled: true
   trigger_ratio: 0.8           # 达到 context_window 的 80% 时触发摘要
 
-idle:
-  scan_interval: 15s
-  timeout: 30s
+idle_scanner:
+  scan_interval: 10s
 
 log:
   level: info
