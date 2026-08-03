@@ -18,10 +18,7 @@ var (
 		{Name: "business_type", Type: field.TypeString, Nullable: true, Default: ""},
 		{Name: "business_meta", Type: field.TypeJSON, Nullable: true},
 		{Name: "mode", Type: field.TypeString, Default: "agent"},
-		{Name: "heartbeat_interval", Type: field.TypeInt, Default: 10},
 		{Name: "summary", Type: field.TypeString, Nullable: true, Size: 2147483647, Default: ""},
-		{Name: "locked_by", Type: field.TypeString, Nullable: true, Default: ""},
-		{Name: "locked_at", Type: field.TypeTime, Nullable: true},
 		{Name: "create_time", Type: field.TypeTime},
 		{Name: "update_time", Type: field.TypeTime},
 	}

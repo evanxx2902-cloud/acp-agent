@@ -33,31 +33,27 @@ const (
 // SessionMutation represents an operation that mutates the Session nodes in the graph.
 type SessionMutation struct {
 	config
-	op                    Op
-	typ                   string
-	id                    *string
-	status                *session.Status
-	user_id               *int64
-	adduser_id            *int64
-	username              *string
-	business_id           *string
-	business_type         *string
-	business_meta         *map[string]interface{}
-	mode                  *string
-	heartbeat_interval    *int
-	addheartbeat_interval *int
-	summary               *string
-	locked_by             *string
-	locked_at             *time.Time
-	create_time           *time.Time
-	update_time           *time.Time
-	clearedFields         map[string]struct{}
-	messages              map[int64]struct{}
-	removedmessages       map[int64]struct{}
-	clearedmessages       bool
-	done                  bool
-	oldValue              func(context.Context) (*Session, error)
-	predicates            []predicate.Session
+	op              Op
+	typ             string
+	id              *string
+	status          *session.Status
+	user_id         *int64
+	adduser_id      *int64
+	username        *string
+	business_id     *string
+	business_type   *string
+	business_meta   *map[string]interface{}
+	mode            *string
+	summary         *string
+	create_time     *time.Time
+	update_time     *time.Time
+	clearedFields   map[string]struct{}
+	messages        map[int64]struct{}
+	removedmessages map[int64]struct{}
+	clearedmessages bool
+	done            bool
+	oldValue        func(context.Context) (*Session, error)
+	predicates      []predicate.Session
 }
 
 var _ ent.Mutation = (*SessionMutation)(nil)
@@ -502,62 +498,6 @@ func (m *SessionMutation) ResetMode() {
 	m.mode = nil
 }
 
-// SetHeartbeatInterval sets the "heartbeat_interval" field.
-func (m *SessionMutation) SetHeartbeatInterval(i int) {
-	m.heartbeat_interval = &i
-	m.addheartbeat_interval = nil
-}
-
-// HeartbeatInterval returns the value of the "heartbeat_interval" field in the mutation.
-func (m *SessionMutation) HeartbeatInterval() (r int, exists bool) {
-	v := m.heartbeat_interval
-	if v == nil {
-		return
-	}
-	return *v, true
-}
-
-// OldHeartbeatInterval returns the old "heartbeat_interval" field's value of the Session entity.
-// If the Session object wasn't provided to the builder, the object is fetched from the database.
-// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
-func (m *SessionMutation) OldHeartbeatInterval(ctx context.Context) (v int, err error) {
-	if !m.op.Is(OpUpdateOne) {
-		return v, errors.New("OldHeartbeatInterval is only allowed on UpdateOne operations")
-	}
-	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldHeartbeatInterval requires an ID field in the mutation")
-	}
-	oldValue, err := m.oldValue(ctx)
-	if err != nil {
-		return v, fmt.Errorf("querying old value for OldHeartbeatInterval: %w", err)
-	}
-	return oldValue.HeartbeatInterval, nil
-}
-
-// AddHeartbeatInterval adds i to the "heartbeat_interval" field.
-func (m *SessionMutation) AddHeartbeatInterval(i int) {
-	if m.addheartbeat_interval != nil {
-		*m.addheartbeat_interval += i
-	} else {
-		m.addheartbeat_interval = &i
-	}
-}
-
-// AddedHeartbeatInterval returns the value that was added to the "heartbeat_interval" field in this mutation.
-func (m *SessionMutation) AddedHeartbeatInterval() (r int, exists bool) {
-	v := m.addheartbeat_interval
-	if v == nil {
-		return
-	}
-	return *v, true
-}
-
-// ResetHeartbeatInterval resets all changes to the "heartbeat_interval" field.
-func (m *SessionMutation) ResetHeartbeatInterval() {
-	m.heartbeat_interval = nil
-	m.addheartbeat_interval = nil
-}
-
 // SetSummary sets the "summary" field.
 func (m *SessionMutation) SetSummary(s string) {
 	m.summary = &s
@@ -605,104 +545,6 @@ func (m *SessionMutation) SummaryCleared() bool {
 func (m *SessionMutation) ResetSummary() {
 	m.summary = nil
 	delete(m.clearedFields, session.FieldSummary)
-}
-
-// SetLockedBy sets the "locked_by" field.
-func (m *SessionMutation) SetLockedBy(s string) {
-	m.locked_by = &s
-}
-
-// LockedBy returns the value of the "locked_by" field in the mutation.
-func (m *SessionMutation) LockedBy() (r string, exists bool) {
-	v := m.locked_by
-	if v == nil {
-		return
-	}
-	return *v, true
-}
-
-// OldLockedBy returns the old "locked_by" field's value of the Session entity.
-// If the Session object wasn't provided to the builder, the object is fetched from the database.
-// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
-func (m *SessionMutation) OldLockedBy(ctx context.Context) (v string, err error) {
-	if !m.op.Is(OpUpdateOne) {
-		return v, errors.New("OldLockedBy is only allowed on UpdateOne operations")
-	}
-	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldLockedBy requires an ID field in the mutation")
-	}
-	oldValue, err := m.oldValue(ctx)
-	if err != nil {
-		return v, fmt.Errorf("querying old value for OldLockedBy: %w", err)
-	}
-	return oldValue.LockedBy, nil
-}
-
-// ClearLockedBy clears the value of the "locked_by" field.
-func (m *SessionMutation) ClearLockedBy() {
-	m.locked_by = nil
-	m.clearedFields[session.FieldLockedBy] = struct{}{}
-}
-
-// LockedByCleared returns if the "locked_by" field was cleared in this mutation.
-func (m *SessionMutation) LockedByCleared() bool {
-	_, ok := m.clearedFields[session.FieldLockedBy]
-	return ok
-}
-
-// ResetLockedBy resets all changes to the "locked_by" field.
-func (m *SessionMutation) ResetLockedBy() {
-	m.locked_by = nil
-	delete(m.clearedFields, session.FieldLockedBy)
-}
-
-// SetLockedAt sets the "locked_at" field.
-func (m *SessionMutation) SetLockedAt(t time.Time) {
-	m.locked_at = &t
-}
-
-// LockedAt returns the value of the "locked_at" field in the mutation.
-func (m *SessionMutation) LockedAt() (r time.Time, exists bool) {
-	v := m.locked_at
-	if v == nil {
-		return
-	}
-	return *v, true
-}
-
-// OldLockedAt returns the old "locked_at" field's value of the Session entity.
-// If the Session object wasn't provided to the builder, the object is fetched from the database.
-// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
-func (m *SessionMutation) OldLockedAt(ctx context.Context) (v time.Time, err error) {
-	if !m.op.Is(OpUpdateOne) {
-		return v, errors.New("OldLockedAt is only allowed on UpdateOne operations")
-	}
-	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldLockedAt requires an ID field in the mutation")
-	}
-	oldValue, err := m.oldValue(ctx)
-	if err != nil {
-		return v, fmt.Errorf("querying old value for OldLockedAt: %w", err)
-	}
-	return oldValue.LockedAt, nil
-}
-
-// ClearLockedAt clears the value of the "locked_at" field.
-func (m *SessionMutation) ClearLockedAt() {
-	m.locked_at = nil
-	m.clearedFields[session.FieldLockedAt] = struct{}{}
-}
-
-// LockedAtCleared returns if the "locked_at" field was cleared in this mutation.
-func (m *SessionMutation) LockedAtCleared() bool {
-	_, ok := m.clearedFields[session.FieldLockedAt]
-	return ok
-}
-
-// ResetLockedAt resets all changes to the "locked_at" field.
-func (m *SessionMutation) ResetLockedAt() {
-	m.locked_at = nil
-	delete(m.clearedFields, session.FieldLockedAt)
 }
 
 // SetCreateTime sets the "create_time" field.
@@ -865,7 +707,7 @@ func (m *SessionMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *SessionMutation) Fields() []string {
-	fields := make([]string, 0, 13)
+	fields := make([]string, 0, 10)
 	if m.status != nil {
 		fields = append(fields, session.FieldStatus)
 	}
@@ -887,17 +729,8 @@ func (m *SessionMutation) Fields() []string {
 	if m.mode != nil {
 		fields = append(fields, session.FieldMode)
 	}
-	if m.heartbeat_interval != nil {
-		fields = append(fields, session.FieldHeartbeatInterval)
-	}
 	if m.summary != nil {
 		fields = append(fields, session.FieldSummary)
-	}
-	if m.locked_by != nil {
-		fields = append(fields, session.FieldLockedBy)
-	}
-	if m.locked_at != nil {
-		fields = append(fields, session.FieldLockedAt)
 	}
 	if m.create_time != nil {
 		fields = append(fields, session.FieldCreateTime)
@@ -927,14 +760,8 @@ func (m *SessionMutation) Field(name string) (ent.Value, bool) {
 		return m.BusinessMeta()
 	case session.FieldMode:
 		return m.Mode()
-	case session.FieldHeartbeatInterval:
-		return m.HeartbeatInterval()
 	case session.FieldSummary:
 		return m.Summary()
-	case session.FieldLockedBy:
-		return m.LockedBy()
-	case session.FieldLockedAt:
-		return m.LockedAt()
 	case session.FieldCreateTime:
 		return m.CreateTime()
 	case session.FieldUpdateTime:
@@ -962,14 +789,8 @@ func (m *SessionMutation) OldField(ctx context.Context, name string) (ent.Value,
 		return m.OldBusinessMeta(ctx)
 	case session.FieldMode:
 		return m.OldMode(ctx)
-	case session.FieldHeartbeatInterval:
-		return m.OldHeartbeatInterval(ctx)
 	case session.FieldSummary:
 		return m.OldSummary(ctx)
-	case session.FieldLockedBy:
-		return m.OldLockedBy(ctx)
-	case session.FieldLockedAt:
-		return m.OldLockedAt(ctx)
 	case session.FieldCreateTime:
 		return m.OldCreateTime(ctx)
 	case session.FieldUpdateTime:
@@ -1032,33 +853,12 @@ func (m *SessionMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetMode(v)
 		return nil
-	case session.FieldHeartbeatInterval:
-		v, ok := value.(int)
-		if !ok {
-			return fmt.Errorf("unexpected type %T for field %s", value, name)
-		}
-		m.SetHeartbeatInterval(v)
-		return nil
 	case session.FieldSummary:
 		v, ok := value.(string)
 		if !ok {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetSummary(v)
-		return nil
-	case session.FieldLockedBy:
-		v, ok := value.(string)
-		if !ok {
-			return fmt.Errorf("unexpected type %T for field %s", value, name)
-		}
-		m.SetLockedBy(v)
-		return nil
-	case session.FieldLockedAt:
-		v, ok := value.(time.Time)
-		if !ok {
-			return fmt.Errorf("unexpected type %T for field %s", value, name)
-		}
-		m.SetLockedAt(v)
 		return nil
 	case session.FieldCreateTime:
 		v, ok := value.(time.Time)
@@ -1085,9 +885,6 @@ func (m *SessionMutation) AddedFields() []string {
 	if m.adduser_id != nil {
 		fields = append(fields, session.FieldUserID)
 	}
-	if m.addheartbeat_interval != nil {
-		fields = append(fields, session.FieldHeartbeatInterval)
-	}
 	return fields
 }
 
@@ -1098,8 +895,6 @@ func (m *SessionMutation) AddedField(name string) (ent.Value, bool) {
 	switch name {
 	case session.FieldUserID:
 		return m.AddedUserID()
-	case session.FieldHeartbeatInterval:
-		return m.AddedHeartbeatInterval()
 	}
 	return nil, false
 }
@@ -1115,13 +910,6 @@ func (m *SessionMutation) AddField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.AddUserID(v)
-		return nil
-	case session.FieldHeartbeatInterval:
-		v, ok := value.(int)
-		if !ok {
-			return fmt.Errorf("unexpected type %T for field %s", value, name)
-		}
-		m.AddHeartbeatInterval(v)
 		return nil
 	}
 	return fmt.Errorf("unknown Session numeric field %s", name)
@@ -1148,12 +936,6 @@ func (m *SessionMutation) ClearedFields() []string {
 	}
 	if m.FieldCleared(session.FieldSummary) {
 		fields = append(fields, session.FieldSummary)
-	}
-	if m.FieldCleared(session.FieldLockedBy) {
-		fields = append(fields, session.FieldLockedBy)
-	}
-	if m.FieldCleared(session.FieldLockedAt) {
-		fields = append(fields, session.FieldLockedAt)
 	}
 	return fields
 }
@@ -1187,12 +969,6 @@ func (m *SessionMutation) ClearField(name string) error {
 	case session.FieldSummary:
 		m.ClearSummary()
 		return nil
-	case session.FieldLockedBy:
-		m.ClearLockedBy()
-		return nil
-	case session.FieldLockedAt:
-		m.ClearLockedAt()
-		return nil
 	}
 	return fmt.Errorf("unknown Session nullable field %s", name)
 }
@@ -1222,17 +998,8 @@ func (m *SessionMutation) ResetField(name string) error {
 	case session.FieldMode:
 		m.ResetMode()
 		return nil
-	case session.FieldHeartbeatInterval:
-		m.ResetHeartbeatInterval()
-		return nil
 	case session.FieldSummary:
 		m.ResetSummary()
-		return nil
-	case session.FieldLockedBy:
-		m.ResetLockedBy()
-		return nil
-	case session.FieldLockedAt:
-		m.ResetLockedAt()
 		return nil
 	case session.FieldCreateTime:
 		m.ResetCreateTime()

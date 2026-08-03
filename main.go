@@ -99,8 +99,6 @@ func main() {
 		serveStdio(cfg, llmProvider, modelInfo, entClient, logger)
 	}
 
-	// Mark active sessions as idle on shutdown
-	_ = sessionMgr.MarkActiveAsIdle(context.Background())
 	slog.Info("agent server shutting down")
 }
 
@@ -112,6 +110,7 @@ func serveStdio(cfg Config, llmProvider LLMConfigProvider, modelInfo ModelInfoPr
 
 	slog.Info("agent server started (stdio)", "version", acp.ProtocolVersionNumber)
 	<-conn.Done()
+	ag.OnDisconnect(context.Background())
 	slog.Info("agent server shutting down")
 }
 
@@ -149,6 +148,7 @@ func serveTCP(ctx context.Context, addr string, cfg Config, llmProvider LLMConfi
 			conn.SetLogger(logger)
 			ag.SetConnection(conn)
 			<-conn.Done()
+			ag.OnDisconnect(context.Background())
 		}(raw)
 	}
 }
@@ -195,6 +195,7 @@ func serveUnix(ctx context.Context, path string, cfg Config, llmProvider LLMConf
 			conn.SetLogger(logger)
 			ag.SetConnection(conn)
 			<-conn.Done()
+			ag.OnDisconnect(context.Background())
 		}(raw)
 	}
 }

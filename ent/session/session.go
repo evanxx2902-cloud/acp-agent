@@ -29,14 +29,8 @@ const (
 	FieldBusinessMeta = "business_meta"
 	// FieldMode holds the string denoting the mode field in the database.
 	FieldMode = "mode"
-	// FieldHeartbeatInterval holds the string denoting the heartbeat_interval field in the database.
-	FieldHeartbeatInterval = "heartbeat_interval"
 	// FieldSummary holds the string denoting the summary field in the database.
 	FieldSummary = "summary"
-	// FieldLockedBy holds the string denoting the locked_by field in the database.
-	FieldLockedBy = "locked_by"
-	// FieldLockedAt holds the string denoting the locked_at field in the database.
-	FieldLockedAt = "locked_at"
 	// FieldCreateTime holds the string denoting the create_time field in the database.
 	FieldCreateTime = "create_time"
 	// FieldUpdateTime holds the string denoting the update_time field in the database.
@@ -64,10 +58,7 @@ var Columns = []string{
 	FieldBusinessType,
 	FieldBusinessMeta,
 	FieldMode,
-	FieldHeartbeatInterval,
 	FieldSummary,
-	FieldLockedBy,
-	FieldLockedAt,
 	FieldCreateTime,
 	FieldUpdateTime,
 }
@@ -95,12 +86,8 @@ var (
 	DefaultBusinessMeta func() map[string]interface{}
 	// DefaultMode holds the default value on creation for the "mode" field.
 	DefaultMode string
-	// DefaultHeartbeatInterval holds the default value on creation for the "heartbeat_interval" field.
-	DefaultHeartbeatInterval int
 	// DefaultSummary holds the default value on creation for the "summary" field.
 	DefaultSummary string
-	// DefaultLockedBy holds the default value on creation for the "locked_by" field.
-	DefaultLockedBy string
 	// DefaultCreateTime holds the default value on creation for the "create_time" field.
 	DefaultCreateTime func() time.Time
 	// DefaultUpdateTime holds the default value on creation for the "update_time" field.
@@ -174,24 +161,9 @@ func ByMode(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldMode, opts...).ToFunc()
 }
 
-// ByHeartbeatInterval orders the results by the heartbeat_interval field.
-func ByHeartbeatInterval(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldHeartbeatInterval, opts...).ToFunc()
-}
-
 // BySummary orders the results by the summary field.
 func BySummary(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldSummary, opts...).ToFunc()
-}
-
-// ByLockedBy orders the results by the locked_by field.
-func ByLockedBy(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldLockedBy, opts...).ToFunc()
-}
-
-// ByLockedAt orders the results by the locked_at field.
-func ByLockedAt(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldLockedAt, opts...).ToFunc()
 }
 
 // ByCreateTime orders the results by the create_time field.

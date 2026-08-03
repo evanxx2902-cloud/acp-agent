@@ -56,23 +56,10 @@ func (Session) Fields() []ent.Field {
 			Immutable().
 			Comment("Execution mode: agent | plan. Immutable after creation."),
 
-		field.Int("heartbeat_interval").
-			Default(10).
-			Comment("Client heartbeat interval in seconds, server timeout = 3x this value"),
-
 		field.Text("summary").
 			Optional().
 			Default("").
 			Comment("Conversation summary, updated by summarization middleware"),
-
-		field.String("locked_by").
-			Optional().
-			Default("").
-			Comment("Connection ID that currently owns this session"),
-
-		field.Time("locked_at").
-			Optional().
-			Comment("When the session was locked by the current owner"),
 
 		field.Time("create_time").
 			Immutable().

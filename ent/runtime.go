@@ -39,24 +39,16 @@ func init() {
 	sessionDescMode := sessionFields[7].Descriptor()
 	// session.DefaultMode holds the default value on creation for the mode field.
 	session.DefaultMode = sessionDescMode.Default.(string)
-	// sessionDescHeartbeatInterval is the schema descriptor for heartbeat_interval field.
-	sessionDescHeartbeatInterval := sessionFields[8].Descriptor()
-	// session.DefaultHeartbeatInterval holds the default value on creation for the heartbeat_interval field.
-	session.DefaultHeartbeatInterval = sessionDescHeartbeatInterval.Default.(int)
 	// sessionDescSummary is the schema descriptor for summary field.
-	sessionDescSummary := sessionFields[9].Descriptor()
+	sessionDescSummary := sessionFields[8].Descriptor()
 	// session.DefaultSummary holds the default value on creation for the summary field.
 	session.DefaultSummary = sessionDescSummary.Default.(string)
-	// sessionDescLockedBy is the schema descriptor for locked_by field.
-	sessionDescLockedBy := sessionFields[10].Descriptor()
-	// session.DefaultLockedBy holds the default value on creation for the locked_by field.
-	session.DefaultLockedBy = sessionDescLockedBy.Default.(string)
 	// sessionDescCreateTime is the schema descriptor for create_time field.
-	sessionDescCreateTime := sessionFields[12].Descriptor()
+	sessionDescCreateTime := sessionFields[9].Descriptor()
 	// session.DefaultCreateTime holds the default value on creation for the create_time field.
 	session.DefaultCreateTime = sessionDescCreateTime.Default.(func() time.Time)
 	// sessionDescUpdateTime is the schema descriptor for update_time field.
-	sessionDescUpdateTime := sessionFields[13].Descriptor()
+	sessionDescUpdateTime := sessionFields[10].Descriptor()
 	// session.DefaultUpdateTime holds the default value on creation for the update_time field.
 	session.DefaultUpdateTime = sessionDescUpdateTime.Default.(func() time.Time)
 	// session.UpdateDefaultUpdateTime holds the default value on update for the update_time field.

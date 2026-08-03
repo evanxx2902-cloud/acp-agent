@@ -90,24 +90,9 @@ func Mode(v string) predicate.Session {
 	return predicate.Session(sql.FieldEQ(FieldMode, v))
 }
 
-// HeartbeatInterval applies equality check predicate on the "heartbeat_interval" field. It's identical to HeartbeatIntervalEQ.
-func HeartbeatInterval(v int) predicate.Session {
-	return predicate.Session(sql.FieldEQ(FieldHeartbeatInterval, v))
-}
-
 // Summary applies equality check predicate on the "summary" field. It's identical to SummaryEQ.
 func Summary(v string) predicate.Session {
 	return predicate.Session(sql.FieldEQ(FieldSummary, v))
-}
-
-// LockedBy applies equality check predicate on the "locked_by" field. It's identical to LockedByEQ.
-func LockedBy(v string) predicate.Session {
-	return predicate.Session(sql.FieldEQ(FieldLockedBy, v))
-}
-
-// LockedAt applies equality check predicate on the "locked_at" field. It's identical to LockedAtEQ.
-func LockedAt(v time.Time) predicate.Session {
-	return predicate.Session(sql.FieldEQ(FieldLockedAt, v))
 }
 
 // CreateTime applies equality check predicate on the "create_time" field. It's identical to CreateTimeEQ.
@@ -490,46 +475,6 @@ func ModeContainsFold(v string) predicate.Session {
 	return predicate.Session(sql.FieldContainsFold(FieldMode, v))
 }
 
-// HeartbeatIntervalEQ applies the EQ predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalEQ(v int) predicate.Session {
-	return predicate.Session(sql.FieldEQ(FieldHeartbeatInterval, v))
-}
-
-// HeartbeatIntervalNEQ applies the NEQ predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalNEQ(v int) predicate.Session {
-	return predicate.Session(sql.FieldNEQ(FieldHeartbeatInterval, v))
-}
-
-// HeartbeatIntervalIn applies the In predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalIn(vs ...int) predicate.Session {
-	return predicate.Session(sql.FieldIn(FieldHeartbeatInterval, vs...))
-}
-
-// HeartbeatIntervalNotIn applies the NotIn predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalNotIn(vs ...int) predicate.Session {
-	return predicate.Session(sql.FieldNotIn(FieldHeartbeatInterval, vs...))
-}
-
-// HeartbeatIntervalGT applies the GT predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalGT(v int) predicate.Session {
-	return predicate.Session(sql.FieldGT(FieldHeartbeatInterval, v))
-}
-
-// HeartbeatIntervalGTE applies the GTE predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalGTE(v int) predicate.Session {
-	return predicate.Session(sql.FieldGTE(FieldHeartbeatInterval, v))
-}
-
-// HeartbeatIntervalLT applies the LT predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalLT(v int) predicate.Session {
-	return predicate.Session(sql.FieldLT(FieldHeartbeatInterval, v))
-}
-
-// HeartbeatIntervalLTE applies the LTE predicate on the "heartbeat_interval" field.
-func HeartbeatIntervalLTE(v int) predicate.Session {
-	return predicate.Session(sql.FieldLTE(FieldHeartbeatInterval, v))
-}
-
 // SummaryEQ applies the EQ predicate on the "summary" field.
 func SummaryEQ(v string) predicate.Session {
 	return predicate.Session(sql.FieldEQ(FieldSummary, v))
@@ -603,131 +548,6 @@ func SummaryEqualFold(v string) predicate.Session {
 // SummaryContainsFold applies the ContainsFold predicate on the "summary" field.
 func SummaryContainsFold(v string) predicate.Session {
 	return predicate.Session(sql.FieldContainsFold(FieldSummary, v))
-}
-
-// LockedByEQ applies the EQ predicate on the "locked_by" field.
-func LockedByEQ(v string) predicate.Session {
-	return predicate.Session(sql.FieldEQ(FieldLockedBy, v))
-}
-
-// LockedByNEQ applies the NEQ predicate on the "locked_by" field.
-func LockedByNEQ(v string) predicate.Session {
-	return predicate.Session(sql.FieldNEQ(FieldLockedBy, v))
-}
-
-// LockedByIn applies the In predicate on the "locked_by" field.
-func LockedByIn(vs ...string) predicate.Session {
-	return predicate.Session(sql.FieldIn(FieldLockedBy, vs...))
-}
-
-// LockedByNotIn applies the NotIn predicate on the "locked_by" field.
-func LockedByNotIn(vs ...string) predicate.Session {
-	return predicate.Session(sql.FieldNotIn(FieldLockedBy, vs...))
-}
-
-// LockedByGT applies the GT predicate on the "locked_by" field.
-func LockedByGT(v string) predicate.Session {
-	return predicate.Session(sql.FieldGT(FieldLockedBy, v))
-}
-
-// LockedByGTE applies the GTE predicate on the "locked_by" field.
-func LockedByGTE(v string) predicate.Session {
-	return predicate.Session(sql.FieldGTE(FieldLockedBy, v))
-}
-
-// LockedByLT applies the LT predicate on the "locked_by" field.
-func LockedByLT(v string) predicate.Session {
-	return predicate.Session(sql.FieldLT(FieldLockedBy, v))
-}
-
-// LockedByLTE applies the LTE predicate on the "locked_by" field.
-func LockedByLTE(v string) predicate.Session {
-	return predicate.Session(sql.FieldLTE(FieldLockedBy, v))
-}
-
-// LockedByContains applies the Contains predicate on the "locked_by" field.
-func LockedByContains(v string) predicate.Session {
-	return predicate.Session(sql.FieldContains(FieldLockedBy, v))
-}
-
-// LockedByHasPrefix applies the HasPrefix predicate on the "locked_by" field.
-func LockedByHasPrefix(v string) predicate.Session {
-	return predicate.Session(sql.FieldHasPrefix(FieldLockedBy, v))
-}
-
-// LockedByHasSuffix applies the HasSuffix predicate on the "locked_by" field.
-func LockedByHasSuffix(v string) predicate.Session {
-	return predicate.Session(sql.FieldHasSuffix(FieldLockedBy, v))
-}
-
-// LockedByIsNil applies the IsNil predicate on the "locked_by" field.
-func LockedByIsNil() predicate.Session {
-	return predicate.Session(sql.FieldIsNull(FieldLockedBy))
-}
-
-// LockedByNotNil applies the NotNil predicate on the "locked_by" field.
-func LockedByNotNil() predicate.Session {
-	return predicate.Session(sql.FieldNotNull(FieldLockedBy))
-}
-
-// LockedByEqualFold applies the EqualFold predicate on the "locked_by" field.
-func LockedByEqualFold(v string) predicate.Session {
-	return predicate.Session(sql.FieldEqualFold(FieldLockedBy, v))
-}
-
-// LockedByContainsFold applies the ContainsFold predicate on the "locked_by" field.
-func LockedByContainsFold(v string) predicate.Session {
-	return predicate.Session(sql.FieldContainsFold(FieldLockedBy, v))
-}
-
-// LockedAtEQ applies the EQ predicate on the "locked_at" field.
-func LockedAtEQ(v time.Time) predicate.Session {
-	return predicate.Session(sql.FieldEQ(FieldLockedAt, v))
-}
-
-// LockedAtNEQ applies the NEQ predicate on the "locked_at" field.
-func LockedAtNEQ(v time.Time) predicate.Session {
-	return predicate.Session(sql.FieldNEQ(FieldLockedAt, v))
-}
-
-// LockedAtIn applies the In predicate on the "locked_at" field.
-func LockedAtIn(vs ...time.Time) predicate.Session {
-	return predicate.Session(sql.FieldIn(FieldLockedAt, vs...))
-}
-
-// LockedAtNotIn applies the NotIn predicate on the "locked_at" field.
-func LockedAtNotIn(vs ...time.Time) predicate.Session {
-	return predicate.Session(sql.FieldNotIn(FieldLockedAt, vs...))
-}
-
-// LockedAtGT applies the GT predicate on the "locked_at" field.
-func LockedAtGT(v time.Time) predicate.Session {
-	return predicate.Session(sql.FieldGT(FieldLockedAt, v))
-}
-
-// LockedAtGTE applies the GTE predicate on the "locked_at" field.
-func LockedAtGTE(v time.Time) predicate.Session {
-	return predicate.Session(sql.FieldGTE(FieldLockedAt, v))
-}
-
-// LockedAtLT applies the LT predicate on the "locked_at" field.
-func LockedAtLT(v time.Time) predicate.Session {
-	return predicate.Session(sql.FieldLT(FieldLockedAt, v))
-}
-
-// LockedAtLTE applies the LTE predicate on the "locked_at" field.
-func LockedAtLTE(v time.Time) predicate.Session {
-	return predicate.Session(sql.FieldLTE(FieldLockedAt, v))
-}
-
-// LockedAtIsNil applies the IsNil predicate on the "locked_at" field.
-func LockedAtIsNil() predicate.Session {
-	return predicate.Session(sql.FieldIsNull(FieldLockedAt))
-}
-
-// LockedAtNotNil applies the NotNil predicate on the "locked_at" field.
-func LockedAtNotNil() predicate.Session {
-	return predicate.Session(sql.FieldNotNull(FieldLockedAt))
 }
 
 // CreateTimeEQ applies the EQ predicate on the "create_time" field.

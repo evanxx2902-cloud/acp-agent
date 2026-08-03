@@ -111,20 +111,6 @@ func (_c *SessionCreate) SetNillableMode(v *string) *SessionCreate {
 	return _c
 }
 
-// SetHeartbeatInterval sets the "heartbeat_interval" field.
-func (_c *SessionCreate) SetHeartbeatInterval(v int) *SessionCreate {
-	_c.mutation.SetHeartbeatInterval(v)
-	return _c
-}
-
-// SetNillableHeartbeatInterval sets the "heartbeat_interval" field if the given value is not nil.
-func (_c *SessionCreate) SetNillableHeartbeatInterval(v *int) *SessionCreate {
-	if v != nil {
-		_c.SetHeartbeatInterval(*v)
-	}
-	return _c
-}
-
 // SetSummary sets the "summary" field.
 func (_c *SessionCreate) SetSummary(v string) *SessionCreate {
 	_c.mutation.SetSummary(v)
@@ -135,34 +121,6 @@ func (_c *SessionCreate) SetSummary(v string) *SessionCreate {
 func (_c *SessionCreate) SetNillableSummary(v *string) *SessionCreate {
 	if v != nil {
 		_c.SetSummary(*v)
-	}
-	return _c
-}
-
-// SetLockedBy sets the "locked_by" field.
-func (_c *SessionCreate) SetLockedBy(v string) *SessionCreate {
-	_c.mutation.SetLockedBy(v)
-	return _c
-}
-
-// SetNillableLockedBy sets the "locked_by" field if the given value is not nil.
-func (_c *SessionCreate) SetNillableLockedBy(v *string) *SessionCreate {
-	if v != nil {
-		_c.SetLockedBy(*v)
-	}
-	return _c
-}
-
-// SetLockedAt sets the "locked_at" field.
-func (_c *SessionCreate) SetLockedAt(v time.Time) *SessionCreate {
-	_c.mutation.SetLockedAt(v)
-	return _c
-}
-
-// SetNillableLockedAt sets the "locked_at" field if the given value is not nil.
-func (_c *SessionCreate) SetNillableLockedAt(v *time.Time) *SessionCreate {
-	if v != nil {
-		_c.SetLockedAt(*v)
 	}
 	return _c
 }
@@ -279,17 +237,9 @@ func (_c *SessionCreate) defaults() {
 		v := session.DefaultMode
 		_c.mutation.SetMode(v)
 	}
-	if _, ok := _c.mutation.HeartbeatInterval(); !ok {
-		v := session.DefaultHeartbeatInterval
-		_c.mutation.SetHeartbeatInterval(v)
-	}
 	if _, ok := _c.mutation.Summary(); !ok {
 		v := session.DefaultSummary
 		_c.mutation.SetSummary(v)
-	}
-	if _, ok := _c.mutation.LockedBy(); !ok {
-		v := session.DefaultLockedBy
-		_c.mutation.SetLockedBy(v)
 	}
 	if _, ok := _c.mutation.CreateTime(); !ok {
 		v := session.DefaultCreateTime()
@@ -313,9 +263,6 @@ func (_c *SessionCreate) check() error {
 	}
 	if _, ok := _c.mutation.Mode(); !ok {
 		return &ValidationError{Name: "mode", err: errors.New(`ent: missing required field "Session.mode"`)}
-	}
-	if _, ok := _c.mutation.HeartbeatInterval(); !ok {
-		return &ValidationError{Name: "heartbeat_interval", err: errors.New(`ent: missing required field "Session.heartbeat_interval"`)}
 	}
 	if _, ok := _c.mutation.CreateTime(); !ok {
 		return &ValidationError{Name: "create_time", err: errors.New(`ent: missing required field "Session.create_time"`)}
@@ -386,21 +333,9 @@ func (_c *SessionCreate) createSpec() (*Session, *sqlgraph.CreateSpec) {
 		_spec.SetField(session.FieldMode, field.TypeString, value)
 		_node.Mode = value
 	}
-	if value, ok := _c.mutation.HeartbeatInterval(); ok {
-		_spec.SetField(session.FieldHeartbeatInterval, field.TypeInt, value)
-		_node.HeartbeatInterval = value
-	}
 	if value, ok := _c.mutation.Summary(); ok {
 		_spec.SetField(session.FieldSummary, field.TypeString, value)
 		_node.Summary = value
-	}
-	if value, ok := _c.mutation.LockedBy(); ok {
-		_spec.SetField(session.FieldLockedBy, field.TypeString, value)
-		_node.LockedBy = value
-	}
-	if value, ok := _c.mutation.LockedAt(); ok {
-		_spec.SetField(session.FieldLockedAt, field.TypeTime, value)
-		_node.LockedAt = value
 	}
 	if value, ok := _c.mutation.CreateTime(); ok {
 		_spec.SetField(session.FieldCreateTime, field.TypeTime, value)

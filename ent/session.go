@@ -33,14 +33,8 @@ type Session struct {
 	BusinessMeta map[string]interface{} `json:"business_meta,omitempty"`
 	// Execution mode: agent | plan. Immutable after creation.
 	Mode string `json:"mode,omitempty"`
-	// Client heartbeat interval in seconds, server timeout = 3x this value
-	HeartbeatInterval int `json:"heartbeat_interval,omitempty"`
 	// Conversation summary, updated by summarization middleware
 	Summary string `json:"summary,omitempty"`
-	// Connection ID that currently owns this session
-	LockedBy string `json:"locked_by,omitempty"`
-	// When the session was locked by the current owner
-	LockedAt time.Time `json:"locked_at,omitempty"`
 	// Session creation timestamp
 	CreateTime time.Time `json:"create_time,omitempty"`
 	// Session last update timestamp
@@ -76,11 +70,11 @@ func (*Session) scanValues(columns []string) ([]any, error) {
 		switch columns[i] {
 		case session.FieldBusinessMeta:
 			values[i] = new([]byte)
-		case session.FieldUserID, session.FieldHeartbeatInterval:
+		case session.FieldUserID:
 			values[i] = new(sql.NullInt64)
-		case session.FieldID, session.FieldStatus, session.FieldUsername, session.FieldBusinessID, session.FieldBusinessType, session.FieldMode, session.FieldSummary, session.FieldLockedBy:
+		case session.FieldID, session.FieldStatus, session.FieldUsername, session.FieldBusinessID, session.FieldBusinessType, session.FieldMode, session.FieldSummary:
 			values[i] = new(sql.NullString)
-		case session.FieldLockedAt, session.FieldCreateTime, session.FieldUpdateTime:
+		case session.FieldCreateTime, session.FieldUpdateTime:
 			values[i] = new(sql.NullTime)
 		default:
 			values[i] = new(sql.UnknownType)
@@ -147,29 +141,11 @@ func (_m *Session) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.Mode = value.String
 			}
-		case session.FieldHeartbeatInterval:
-			if value, ok := values[i].(*sql.NullInt64); !ok {
-				return fmt.Errorf("unexpected type %T for field heartbeat_interval", values[i])
-			} else if value.Valid {
-				_m.HeartbeatInterval = int(value.Int64)
-			}
 		case session.FieldSummary:
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field summary", values[i])
 			} else if value.Valid {
 				_m.Summary = value.String
-			}
-		case session.FieldLockedBy:
-			if value, ok := values[i].(*sql.NullString); !ok {
-				return fmt.Errorf("unexpected type %T for field locked_by", values[i])
-			} else if value.Valid {
-				_m.LockedBy = value.String
-			}
-		case session.FieldLockedAt:
-			if value, ok := values[i].(*sql.NullTime); !ok {
-				return fmt.Errorf("unexpected type %T for field locked_at", values[i])
-			} else if value.Valid {
-				_m.LockedAt = value.Time
 			}
 		case session.FieldCreateTime:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -245,17 +221,8 @@ func (_m *Session) String() string {
 	builder.WriteString("mode=")
 	builder.WriteString(_m.Mode)
 	builder.WriteString(", ")
-	builder.WriteString("heartbeat_interval=")
-	builder.WriteString(fmt.Sprintf("%v", _m.HeartbeatInterval))
-	builder.WriteString(", ")
 	builder.WriteString("summary=")
 	builder.WriteString(_m.Summary)
-	builder.WriteString(", ")
-	builder.WriteString("locked_by=")
-	builder.WriteString(_m.LockedBy)
-	builder.WriteString(", ")
-	builder.WriteString("locked_at=")
-	builder.WriteString(_m.LockedAt.Format(time.ANSIC))
 	builder.WriteString(", ")
 	builder.WriteString("create_time=")
 	builder.WriteString(_m.CreateTime.Format(time.ANSIC))

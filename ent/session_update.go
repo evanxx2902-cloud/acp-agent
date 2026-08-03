@@ -142,27 +142,6 @@ func (_u *SessionUpdate) ClearBusinessMeta() *SessionUpdate {
 	return _u
 }
 
-// SetHeartbeatInterval sets the "heartbeat_interval" field.
-func (_u *SessionUpdate) SetHeartbeatInterval(v int) *SessionUpdate {
-	_u.mutation.ResetHeartbeatInterval()
-	_u.mutation.SetHeartbeatInterval(v)
-	return _u
-}
-
-// SetNillableHeartbeatInterval sets the "heartbeat_interval" field if the given value is not nil.
-func (_u *SessionUpdate) SetNillableHeartbeatInterval(v *int) *SessionUpdate {
-	if v != nil {
-		_u.SetHeartbeatInterval(*v)
-	}
-	return _u
-}
-
-// AddHeartbeatInterval adds value to the "heartbeat_interval" field.
-func (_u *SessionUpdate) AddHeartbeatInterval(v int) *SessionUpdate {
-	_u.mutation.AddHeartbeatInterval(v)
-	return _u
-}
-
 // SetSummary sets the "summary" field.
 func (_u *SessionUpdate) SetSummary(v string) *SessionUpdate {
 	_u.mutation.SetSummary(v)
@@ -180,46 +159,6 @@ func (_u *SessionUpdate) SetNillableSummary(v *string) *SessionUpdate {
 // ClearSummary clears the value of the "summary" field.
 func (_u *SessionUpdate) ClearSummary() *SessionUpdate {
 	_u.mutation.ClearSummary()
-	return _u
-}
-
-// SetLockedBy sets the "locked_by" field.
-func (_u *SessionUpdate) SetLockedBy(v string) *SessionUpdate {
-	_u.mutation.SetLockedBy(v)
-	return _u
-}
-
-// SetNillableLockedBy sets the "locked_by" field if the given value is not nil.
-func (_u *SessionUpdate) SetNillableLockedBy(v *string) *SessionUpdate {
-	if v != nil {
-		_u.SetLockedBy(*v)
-	}
-	return _u
-}
-
-// ClearLockedBy clears the value of the "locked_by" field.
-func (_u *SessionUpdate) ClearLockedBy() *SessionUpdate {
-	_u.mutation.ClearLockedBy()
-	return _u
-}
-
-// SetLockedAt sets the "locked_at" field.
-func (_u *SessionUpdate) SetLockedAt(v time.Time) *SessionUpdate {
-	_u.mutation.SetLockedAt(v)
-	return _u
-}
-
-// SetNillableLockedAt sets the "locked_at" field if the given value is not nil.
-func (_u *SessionUpdate) SetNillableLockedAt(v *time.Time) *SessionUpdate {
-	if v != nil {
-		_u.SetLockedAt(*v)
-	}
-	return _u
-}
-
-// ClearLockedAt clears the value of the "locked_at" field.
-func (_u *SessionUpdate) ClearLockedAt() *SessionUpdate {
-	_u.mutation.ClearLockedAt()
 	return _u
 }
 
@@ -364,29 +303,11 @@ func (_u *SessionUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.BusinessMetaCleared() {
 		_spec.ClearField(session.FieldBusinessMeta, field.TypeJSON)
 	}
-	if value, ok := _u.mutation.HeartbeatInterval(); ok {
-		_spec.SetField(session.FieldHeartbeatInterval, field.TypeInt, value)
-	}
-	if value, ok := _u.mutation.AddedHeartbeatInterval(); ok {
-		_spec.AddField(session.FieldHeartbeatInterval, field.TypeInt, value)
-	}
 	if value, ok := _u.mutation.Summary(); ok {
 		_spec.SetField(session.FieldSummary, field.TypeString, value)
 	}
 	if _u.mutation.SummaryCleared() {
 		_spec.ClearField(session.FieldSummary, field.TypeString)
-	}
-	if value, ok := _u.mutation.LockedBy(); ok {
-		_spec.SetField(session.FieldLockedBy, field.TypeString, value)
-	}
-	if _u.mutation.LockedByCleared() {
-		_spec.ClearField(session.FieldLockedBy, field.TypeString)
-	}
-	if value, ok := _u.mutation.LockedAt(); ok {
-		_spec.SetField(session.FieldLockedAt, field.TypeTime, value)
-	}
-	if _u.mutation.LockedAtCleared() {
-		_spec.ClearField(session.FieldLockedAt, field.TypeTime)
 	}
 	if value, ok := _u.mutation.UpdateTime(); ok {
 		_spec.SetField(session.FieldUpdateTime, field.TypeTime, value)
@@ -569,27 +490,6 @@ func (_u *SessionUpdateOne) ClearBusinessMeta() *SessionUpdateOne {
 	return _u
 }
 
-// SetHeartbeatInterval sets the "heartbeat_interval" field.
-func (_u *SessionUpdateOne) SetHeartbeatInterval(v int) *SessionUpdateOne {
-	_u.mutation.ResetHeartbeatInterval()
-	_u.mutation.SetHeartbeatInterval(v)
-	return _u
-}
-
-// SetNillableHeartbeatInterval sets the "heartbeat_interval" field if the given value is not nil.
-func (_u *SessionUpdateOne) SetNillableHeartbeatInterval(v *int) *SessionUpdateOne {
-	if v != nil {
-		_u.SetHeartbeatInterval(*v)
-	}
-	return _u
-}
-
-// AddHeartbeatInterval adds value to the "heartbeat_interval" field.
-func (_u *SessionUpdateOne) AddHeartbeatInterval(v int) *SessionUpdateOne {
-	_u.mutation.AddHeartbeatInterval(v)
-	return _u
-}
-
 // SetSummary sets the "summary" field.
 func (_u *SessionUpdateOne) SetSummary(v string) *SessionUpdateOne {
 	_u.mutation.SetSummary(v)
@@ -607,46 +507,6 @@ func (_u *SessionUpdateOne) SetNillableSummary(v *string) *SessionUpdateOne {
 // ClearSummary clears the value of the "summary" field.
 func (_u *SessionUpdateOne) ClearSummary() *SessionUpdateOne {
 	_u.mutation.ClearSummary()
-	return _u
-}
-
-// SetLockedBy sets the "locked_by" field.
-func (_u *SessionUpdateOne) SetLockedBy(v string) *SessionUpdateOne {
-	_u.mutation.SetLockedBy(v)
-	return _u
-}
-
-// SetNillableLockedBy sets the "locked_by" field if the given value is not nil.
-func (_u *SessionUpdateOne) SetNillableLockedBy(v *string) *SessionUpdateOne {
-	if v != nil {
-		_u.SetLockedBy(*v)
-	}
-	return _u
-}
-
-// ClearLockedBy clears the value of the "locked_by" field.
-func (_u *SessionUpdateOne) ClearLockedBy() *SessionUpdateOne {
-	_u.mutation.ClearLockedBy()
-	return _u
-}
-
-// SetLockedAt sets the "locked_at" field.
-func (_u *SessionUpdateOne) SetLockedAt(v time.Time) *SessionUpdateOne {
-	_u.mutation.SetLockedAt(v)
-	return _u
-}
-
-// SetNillableLockedAt sets the "locked_at" field if the given value is not nil.
-func (_u *SessionUpdateOne) SetNillableLockedAt(v *time.Time) *SessionUpdateOne {
-	if v != nil {
-		_u.SetLockedAt(*v)
-	}
-	return _u
-}
-
-// ClearLockedAt clears the value of the "locked_at" field.
-func (_u *SessionUpdateOne) ClearLockedAt() *SessionUpdateOne {
-	_u.mutation.ClearLockedAt()
 	return _u
 }
 
@@ -821,29 +681,11 @@ func (_u *SessionUpdateOne) sqlSave(ctx context.Context) (_node *Session, err er
 	if _u.mutation.BusinessMetaCleared() {
 		_spec.ClearField(session.FieldBusinessMeta, field.TypeJSON)
 	}
-	if value, ok := _u.mutation.HeartbeatInterval(); ok {
-		_spec.SetField(session.FieldHeartbeatInterval, field.TypeInt, value)
-	}
-	if value, ok := _u.mutation.AddedHeartbeatInterval(); ok {
-		_spec.AddField(session.FieldHeartbeatInterval, field.TypeInt, value)
-	}
 	if value, ok := _u.mutation.Summary(); ok {
 		_spec.SetField(session.FieldSummary, field.TypeString, value)
 	}
 	if _u.mutation.SummaryCleared() {
 		_spec.ClearField(session.FieldSummary, field.TypeString)
-	}
-	if value, ok := _u.mutation.LockedBy(); ok {
-		_spec.SetField(session.FieldLockedBy, field.TypeString, value)
-	}
-	if _u.mutation.LockedByCleared() {
-		_spec.ClearField(session.FieldLockedBy, field.TypeString)
-	}
-	if value, ok := _u.mutation.LockedAt(); ok {
-		_spec.SetField(session.FieldLockedAt, field.TypeTime, value)
-	}
-	if _u.mutation.LockedAtCleared() {
-		_spec.ClearField(session.FieldLockedAt, field.TypeTime)
 	}
 	if value, ok := _u.mutation.UpdateTime(); ok {
 		_spec.SetField(session.FieldUpdateTime, field.TypeTime, value)

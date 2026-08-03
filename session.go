@@ -29,11 +29,9 @@ type NewSessionParams struct {
 	BusinessType              string
 	BusinessMeta              map[string]any
 	Mode                      string
-	HeartbeatInterval         int
 	SummarizationTriggerRatio float64
 	MaxIterations             int
 	SystemPrompt              string
-	OwnerAgent                string // connection identifier for ownership
 }
 
 // SessionMeta is a lightweight public view of a session.
@@ -55,24 +53,19 @@ type RuntimeSession struct {
 	ID                        string
 	Mode                      string
 	Summary                   string
-	HeartbeatInterval         int
 	SummarizationTriggerRatio float64
 	MaxIterations             int
 	BusinessMeta              map[string]any
 
-	mu             sync.Mutex
-	messages       []*schema.Message
-	seq            int
-	cancel         context.CancelFunc
-	ctx            context.Context
-	mcpManager     *Manager
-	cmAgent        *adk.ChatModelAgent
-	heartbeatTimer *time.Timer
-	lockedBy       string
-	lockedAt       time.Time
-	status         string
-	promptMu       sync.Mutex // prevents concurrent prompts on same session
-	ownerAgent     string     // connection that currently owns this session
+	mu         sync.Mutex
+	messages   []*schema.Message
+	seq        int
+	cancel     context.CancelFunc
+	ctx        context.Context
+	mcpManager *Manager
+	cmAgent    *adk.ChatModelAgent
+	status     string
+	promptMu   sync.Mutex // prevents concurrent prompts on same session
 }
 
 func (s *RuntimeSession) AppendMessages(msgs ...*schema.Message) {
@@ -147,24 +140,6 @@ func (s *RuntimeSession) SetStatus(st string) {
 	s.status = st
 }
 
-func (s *RuntimeSession) ResetHeartbeat() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.heartbeatTimer != nil {
-		timeout := time.Duration(s.HeartbeatInterval*3) * time.Second
-		s.heartbeatTimer.Reset(timeout)
-	}
-}
-
-func (s *RuntimeSession) StopHeartbeat() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.heartbeatTimer != nil {
-		s.heartbeatTimer.Stop()
-		s.heartbeatTimer = nil
-	}
-}
-
 // TryLockPrompt attempts to acquire the prompt lock. Returns false if busy.
 func (s *RuntimeSession) TryLockPrompt() bool {
 	return s.promptMu.TryLock()
@@ -173,22 +148,6 @@ func (s *RuntimeSession) TryLockPrompt() bool {
 // UnlockPrompt releases the prompt lock.
 func (s *RuntimeSession) UnlockPrompt() {
 	s.promptMu.Unlock()
-}
-
-// OwnedBy returns whether this session is owned by the given connection.
-func (s *RuntimeSession) OwnedBy(agentID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lockedBy == agentID
-}
-
-// LockOwnership sets the owning connection.
-func (s *RuntimeSession) LockOwnership(agentID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lockedBy = agentID
-	s.lockedAt = time.Now()
-	s.ownerAgent = agentID
 }
 
 // =========================================================================
@@ -225,10 +184,6 @@ func (sm *SessionManager) NewSession(ctx context.Context, params NewSessionParam
 	if mode == "" {
 		mode = "agent"
 	}
-	hi := params.HeartbeatInterval
-	if hi <= 0 {
-		hi = 10
-	}
 	maxIter := params.MaxIterations
 	if maxIter <= 0 {
 		maxIter = 20
@@ -252,9 +207,6 @@ func (sm *SessionManager) NewSession(ctx context.Context, params NewSessionParam
 		SetBusinessType(params.BusinessType).
 		SetBusinessMeta(businessMeta).
 		SetMode(mode).
-		SetHeartbeatInterval(hi).
-		SetLockedBy(params.OwnerAgent).
-		SetLockedAt(now).
 		SetCreateTime(now).
 		SetUpdateTime(now).
 		Save(ctx)
@@ -281,25 +233,15 @@ func (sm *SessionManager) NewSession(ctx context.Context, params NewSessionParam
 		seq++
 	}
 
-	timeout := time.Duration(hi*3) * time.Second
-	timer := time.AfterFunc(timeout, func() {
-		sm.onIdleTimeout(id)
-	})
-
 	s := &RuntimeSession{
 		ID:                        id,
 		Mode:                      mode,
-		HeartbeatInterval:         hi,
 		SummarizationTriggerRatio: str,
 		MaxIterations:             maxIter,
 		BusinessMeta:              businessMeta,
 		messages:                  initMsgs,
 		seq:                       seq,
 		status:                    "active",
-		heartbeatTimer:            timer,
-		lockedBy:                  params.OwnerAgent,
-		lockedAt:                  now,
-		ownerAgent:                params.OwnerAgent,
 	}
 
 	sm.mu.Lock()
@@ -319,7 +261,7 @@ func (sm *SessionManager) GetCached(id string) (*RuntimeSession, bool) {
 }
 
 // Resume loads a session from the database and reconnects MCP.
-func (sm *SessionManager) Resume(ctx context.Context, id string, mcpServers []any, ownerAgent string) (*RuntimeSession, error) {
+func (sm *SessionManager) Resume(ctx context.Context, id string, mcpServers []any) (*RuntimeSession, error) {
 	// Load session from DB
 	sess, err := sm.entClient.Session.Get(ctx, id)
 	if err != nil {
@@ -373,35 +315,22 @@ func (sm *SessionManager) Resume(ctx context.Context, id string, mcpServers []an
 	now := time.Now()
 	_, err = sm.entClient.Session.UpdateOneID(id).
 		SetStatus(entSession.StatusActive).
-		SetLockedBy(ownerAgent).
-		SetLockedAt(now).
 		SetUpdateTime(now).
 		Save(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("update session status: %w", err)
 	}
 
-	heartbeatInterval := sess.HeartbeatInterval
-	timeout := time.Duration(heartbeatInterval*3) * time.Second
-	timer := time.AfterFunc(timeout, func() {
-		sm.onIdleTimeout(id)
-	})
-
 	s := &RuntimeSession{
 		ID:                        id,
 		Mode:                      sess.Mode,
 		Summary:                   sess.Summary,
-		HeartbeatInterval:         heartbeatInterval,
 		SummarizationTriggerRatio: 0.8,
 		MaxIterations:             20,
 		BusinessMeta:              sess.BusinessMeta,
 		messages:                  messages,
 		seq:                       len(messages),
 		status:                    "active",
-		heartbeatTimer:            timer,
-		lockedBy:                  ownerAgent,
-		lockedAt:                  now,
-		ownerAgent:                ownerAgent,
 	}
 
 	sm.mu.Lock()
@@ -419,7 +348,6 @@ func (sm *SessionManager) Close(ctx context.Context, id string) error {
 		return fmt.Errorf("session %s not found in cache", id)
 	}
 
-	s.StopHeartbeat()
 	s.CloseMCP()
 
 	_, err := sm.entClient.Session.UpdateOneID(id).
@@ -445,7 +373,6 @@ func (sm *SessionManager) MarkIdle(ctx context.Context, id string) error {
 		return nil // already gone
 	}
 
-	s.StopHeartbeat()
 	s.CloseMCP()
 	s.SetStatus("idle")
 
@@ -509,16 +436,6 @@ func (sm *SessionManager) List(ctx context.Context) ([]SessionMeta, error) {
 	return out, nil
 }
 
-// MarkActiveAsIdle marks all active sessions as idle (called on shutdown).
-func (sm *SessionManager) MarkActiveAsIdle(ctx context.Context) error {
-	_, err := sm.entClient.Session.Update().
-		Where(entSession.StatusEQ(entSession.StatusActive)).
-		SetStatus(entSession.StatusIdle).
-		SetUpdateTime(time.Now()).
-		Save(ctx)
-	return err
-}
-
 // PersistMessages saves in-memory messages to the database.
 func (sm *SessionManager) PersistMessages(ctx context.Context, sessionID string, startSeq int, messages []*schema.Message) error {
 	now := time.Now()
@@ -560,28 +477,6 @@ func (sm *SessionManager) PersistMessages(ctx context.Context, sessionID string,
 		}
 	}
 	return nil
-}
-
-// onIdleTimeout is called when the heartbeat timer fires.
-func (sm *SessionManager) onIdleTimeout(id string) {
-	s, ok := sm.GetCached(id)
-	if !ok {
-		return
-	}
-	s.SetStatus("idle")
-	s.CloseMCP()
-
-	ctx := context.Background()
-	_, err := sm.entClient.Session.UpdateOneID(id).
-		SetStatus(entSession.StatusIdle).
-		SetUpdateTime(time.Now()).
-		Save(ctx)
-	if err != nil {
-		slog.Error("failed to mark session idle on timeout", "id", id, "error", err)
-		return
-	}
-
-	slog.Info("session marked idle (heartbeat timeout)", "id", id)
 }
 
 // parseArgsMap parses a JSON-encoded arguments string back to a map.

@@ -2,19 +2,21 @@
 
 ## 1. 概述
 
-Agent Server 是一个基于 ACP（Agent-Client Protocol）协议的多会话 AI Agent 服务端。它接收客户端连接，管理会话生命周期，编排 LLM + MCP 工具的 ReAct 推理循环，并将结果流式返回给客户端。
+Agent Server 是一个基于 ACP（Agent-Client Protocol）协议的 AI Agent 服务端。它通过 Unix Socket 接收客户端连接，每个连接对应一个会话，管理会话生命周期，编排 LLM + MCP 工具的 ReAct 推理循环，并将结果流式返回给客户端。
+
+**核心设计：一个连接 = 一个会话。** 连接 open 即 session active，连接 close 即 session idle。无需心跳或显式释放。
 
 ### 1.1 技术栈
 
 | 组件 | 选型 | 说明 |
 |------|------|------|
-| 框架 | [Kratos](https://go-kratos.dev/) | HTTP/gRPC 服务框架，提供配置、日志、中间件、依赖注入 |
 | ORM | [Ent](https://entgo.io/) | 类型安全的 Go ORM，自动生成数据模型代码 |
 | 存储 | SQLite（开发）/ PostgreSQL（生产） | 通过 Ent 的数据库驱动适配 |
 | AI 框架 | [Eino](https://github.com/cloudwego/eino) | 字节跳动开源的 AI Agent 框架，提供 ChatModelAgent、ReAct、Runner |
 | LLM | OpenAI 兼容 API | 通过 eino-ext 的 OpenAI adapter |
 | MCP | [mcp-go](https://github.com/mark3labs/mcp-go) | Model Context Protocol 客户端库 |
 | 协议 | ACP (JSON-RPC 2.0) | 通过 acp-go-sdk |
+| 传输 | Unix Socket | 本节点内通信，连接断开即 session 释放 |
 
 ### 1.2 工程结构
 
@@ -97,10 +99,6 @@ func (Session) Fields() []ent.Field {
             Default("agent").
             Immutable().
             Comment("Execution mode: agent | plan. Immutable after creation."),
-
-        field.Int("heartbeat_interval").
-            Default(10).
-            Comment("Client heartbeat interval in seconds, server timeout = 3x this value"),
 
         field.Text("summary").
             Optional().
@@ -225,7 +223,6 @@ type ToolCall struct {
 │  business_type        TEXT               │
 │  business_meta        JSON               │
 │  mode                 TEXT               │
-│  heartbeat_interval   INTEGER            │
 │  summary              TEXT               │
 │  create_time          TIMESTAMP          │
 │  update_time          TIMESTAMP          │
@@ -262,7 +259,6 @@ type ToolCall struct {
 | `id`, `status`, `mode` | 会话核心标识和状态 |
 | `user_id`, `username` | 会话归属 |
 | `business_id`, `business_type`, `business_meta` | 业务上下文 |
-| `heartbeat_interval` | 客户端声明的心跳间隔，服务端据此计算超时（3x） |
 | `summary` | 对话摘要 |
 
 **每次请求由客户端携带的数据：**
@@ -273,9 +269,9 @@ type ToolCall struct {
 
 > `system_prompt` 不存 session 表——`session/new` 时作为 `session_messages` 第一条记录（seq=0, role=system）持久化。
 
+---
 
-
-
+## 3. ACP 协议接口设计
 
 ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以下是 Agent Server 需要实现的全部接口。
 
@@ -291,8 +287,6 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `session/close` | Client → Server | 关闭会话 |
 | `session/list` | Client → Server | 列出用户的所有会话 |
 | `session/cancel` | Client → Server | 取消当前推理 |
-| `_heartbeat` | Client → Server | 心跳扩展，保持会话 active |
-| `_release` | Client → Server | 释放扩展，主动标记会话为 idle |
 | `SessionUpdate` | Server → Client | 通知——流式输出（增量文本、思考、工具调用） |
 | `RequestPermission` | Server → Client | 请求——要求用户授权工具执行 |
 
@@ -316,7 +310,7 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 |------|------|------|
 | `protocol_version` | string | 协商后的协议版本 |
 | `server_info` | object | 服务端名称、版本 |
-| `capabilities` | object | 服务端支持的能力集（streaming, mcp, plan, heartbeat） |
+| `capabilities` | object | 服务端支持的能力集（streaming, mcp, plan） |
 
 **职责：**
 - 协商 ACP 协议版本
@@ -355,7 +349,6 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 | `mode` | string | 否 | 执行模式：`"agent"`（默认）或 `"plan"`，创建后不可变 |
 | `system_prompt` | string | 否 | 系统提示词，持久化为 session_messages 第一条记录（seq=0, role=system），创建后不可变 |
 | `max_iterations` | int | 否 | 单次推理最大轮次，默认 `20`，不可超过服务端硬上限 |
-| `heartbeat_interval` | int | 否 | 客户端心跳间隔（秒），默认 10。服务端超时时间 = 3 × heartbeat_interval |
 | `summarization_trigger_ratio` | float64 | 否 | 摘要触发比例，默认 `0.8`。当前 token 数超过 `context_window × ratio` 时触发 |
 | `business_id` | string | 否 | 业务上下文标识 |
 | `business_type` | string | 否 | 业务上下文类型 |
@@ -433,9 +426,10 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 - 如果传了 prompt，启动 ReAct 推理循环
 
 > 不需要单独的 load 接口——resume 就是「加载 + 恢复」。客户端先 `session/list` 浏览会话，再 `session/resume` 进入对话。
+>
+> 如果当前连接已持有一个 active session，调用 `session/resume` 会自动释放前一个 session（标记为 idle），再恢复目标 session。
 
 ---
-
 #### 3.2.6 session/close
 
 关闭会话，释放资源。不可逆操作。
@@ -527,107 +521,55 @@ ACP 协议基于 JSON-RPC 2.0，Client 发起请求，Agent Server 响应。以�
 
 ---
 
-#### 3.2.9 _heartbeat（扩展方法）
-
-客户端定期发送心跳，防止 Session 被自动标记为 idle。
-
-**请求参数：**
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `session_id` | string | 是 | 会话 ID |
-
-**响应：** 空对象 `{}`。
-
-**职责：**
-- 仅对 `active` 状态的 Session 生效
-- 更新内存中的 `lastHeartbeat` 时间戳
-- 客户端建议每 3 秒发送一次
-
----
-
-#### 3.2.10 _release（扩展方法）
-
-客户端主动释放 Session 控制权，标记为 idle。
-
-**请求参数：**
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `session_id` | string | 是 | 会话 ID |
-
-**响应：** 空对象 `{}`。
-
-**职责：**
-- 如果 Session 是 `active`，标记为 `idle` 并更新 DB
-- 断开所有 MCP 连接（idle 状态的 Session 不保留 MCP 连接）
-- 保留 RuntimeSession 在内存中（含消息历史和 summary），MCPManager 置空
-- 如果已经是 `closed`，忽略
-
----
-
 ## 4. Session 状态机
 
-### 4.1 状态定义
+### 4.1 设计约束
+
+**一个连接一个会话。** Agent 同时只持有一个 session。连接 open 即 session active，连接 close 即 session idle（自动触发，无需客户端显式操作）。
+
+### 4.2 状态定义
 
 | 状态 | 含义 | 允许的操作 |
 |------|------|------------|
-| `active` | 被某个连接独占，禁止同一 session 并发 prompt | prompt, cancel, close, heartbeat, release |
+| `active` | 被某个连接独占，禁止同一 session 并发 prompt | prompt, cancel, close |
 | `idle` | 无连接持有，MCP 已释放，消息和 summary 保留在内存 | resume, close |
 | `closed` | 不可逆终态 | 无 |
 
-> `active` 的独占性：`session/new` 和 `session/resume` 都会将 session 绑定到当前连接。其他连接无法 prompt 一个不属于自己的 active session。
-
-### 4.2 状态流转图
+### 4.3 状态流转图
 
 ```
-                         session/new
-                            │
-                            ▼
-                      ┌──────────┐       session/close
-                      │          │──────────────────────┐
-          ┌──────────►│  ACTIVE  │                      │
-          │           │          │                      │
-          │           └────┬─────┘                      │
-          │                │                            │
-          │                │ _release / heartbeat 超时    │
-          │                │ (断开 MCP，停定时器)          │
-          │                │                            │
-          │                ▼                            ▼
-          │           ┌──────────┐               ┌──────────┐
-          │           │          │ session/close │          │
-          └───────────│   IDLE   │──────────────►│  CLOSED  │
-      session/resume  │          │               │          │
-                      └──────────┘               └──────────┘
+                       session/new
+                          │
+                          ▼
+                    ┌──────────┐       session/close
+                    │          │──────────────────────┐
+        ┌──────────►│  ACTIVE  │                      │
+        │           │          │                      │
+        │           └────┬─────┘                      │
+        │                │                            │
+        │                │ 连接断开（自动）              │
+        │                │ (断开 MCP，标记 idle)         │
+        │                │                            │
+        │                ▼                            ▼
+        │           ┌──────────┐               ┌──────────┐
+        │           │          │ session/close │          │
+        └───────────│   IDLE   │──────────────►│  CLOSED  │
+    session/resume  │          │               │          │
+                    └──────────┘               └──────────┘
 ```
 
-### 4.3 状态转换表
+### 4.4 状态转换表
 
 | 当前状态 | 触发事件 | 目标状态 | 说明 |
 |----------|----------|----------|------|
-| - | `session/new` | `active` | 新建会话，启动心跳定时器 |
+| - | `session/new` | `active` | 新建会话，绑定到当前连接 |
 | `active` | `session/prompt` | `active` | 保持活跃，执行推理 |
 | `active` | `session/cancel` | `active` | 取消推理，仍可继续对话 |
-| `active` | `_release` | `idle` | 断开 MCP，停止定时器 |
-| `active` | heartbeat 定时器到期 | `idle` | 超时未收到心跳，断开 MCP |
-| `active` | `session/close` | `closed` | 停止定时器，断开 MCP，清理内存 |
-| `idle` | `session/resume` | `active` | 从 DB 加载，重连 MCP，启动定时器 |
+| `active` | 连接断开 | `idle` | 内核通知断开，自动断开 MCP，标记 idle |
+| `active` | `session/close` | `closed` | 断开 MCP，清理内存 |
+| `idle` | `session/resume` | `active` | 从 DB 加载，重连 MCP |
 | `idle` | `session/close` | `closed` | 清理内存 |
 | `closed` | 任何操作 | `closed` | 终态，拒绝所有操作 |
-
-### 4.4 心跳超时机制
-
-每个 `active` Session 持有独立的 `*time.Timer`，超时时间 = `3 × heartbeat_interval`。
-
-```
-session/new  ──► timer = time.AfterFunc(3×interval, onIdle)
-_heartbeat   ──► timer.Reset(3×interval)
-_release     ──► timer.Stop() + 断 MCP + 标记 idle
-session/close──► timer.Stop() + 断 MCP + 清内存
-resume       ──► timer = time.AfterFunc(3×interval, onIdle) + 重连 MCP
-```
-
-`onIdle` 回调：标记 Session 为 idle，断开 MCP 连接，更新 DB 状态。各 Session 的定时器独立运行，互不影响。
 
 ---
 
@@ -645,13 +587,12 @@ App
         ├── ChatModel
         ├── MCPManager
         │   └── ToolAdapter
-        ├── heartbeatTimer
         └── Messages
 ```
 
-- `ACPServer` 每接受一个连接创建 `Agent`，`Agent` 实现 `acp.Agent` 接口
-- `SessionManager` 是全局的，管理所有 Agent 的所有 Session
-- 每个 `RuntimeSession` 对应一个会话，持有独立的 LLM 客户端、MCP 连接、心跳定时器、消息历史
+- 每接受一个连接创建一个 `Agent`，`Agent` 实现 `acp.Agent` 接口，同时只持有一个 session
+- `SessionManager` 是全局的，管理所有 session 的缓存和持久化
+- 每个 `RuntimeSession` 对应一个会话，持有独立的 LLM 客户端、MCP 连接、消息历史
 
 ### 5.2 各结构体职责总结
 
@@ -661,7 +602,7 @@ App
 | `ACPServer` | 管理 ACP transport，接收客户端连接，创建 Agent |
 | `Agent` | 处理单个 ACP 连接的协议方法 |
 | `SessionManager` | 全局 Session 内存缓存、持久化、列表查询 |
-| `RuntimeSession` | 单会话运行时：消息历史、心跳定时器、MCP 连接、LLM 客户端 |
+| `RuntimeSession` | 单会话运行时：消息历史、MCP 连接、LLM 客户端 |
 | `MCPManager` | MCP 客户端生命周期、工具发现 |
 | `ToolAdapter` | MCP Tool → Eino InvokableTool |
 | `EntClient` | DB Client |
@@ -682,7 +623,6 @@ CREATE TABLE sessions (
     business_type TEXT DEFAULT '',
     business_meta JSON DEFAULT '{}',
     mode               TEXT NOT NULL DEFAULT 'agent' CHECK (mode IN ('agent', 'plan')),
-    heartbeat_interval INTEGER NOT NULL DEFAULT 10,
     summary            TEXT DEFAULT '',
     create_time   DATETIME NOT NULL,
     update_time   DATETIME NOT NULL
@@ -743,31 +683,17 @@ Client                    Agent Server                   DB              MCP Ser
   │                           │──INSERT messages─────────►│                   │
 ```
 
-### 7.2 Heartbeat 超时自动 Idle
-
-示例：heartbeat_interval = 3s，定时器超时 = 3 × 3 = 9s。
-
-```
-时间轴：
-  0.0s ─── Client 发送 _heartbeat ─── timer.Reset(9s)
-  3.0s ─── Client 发送 _heartbeat ─── timer.Reset(9s)
-  6.0s ─── Client 发送 _heartbeat ─── timer.Reset(9s)
-  9.0s ─── Client 崩溃，不再发心跳
- 15.0s ─── timer 到期（距上次 Reset 已过 9s）
-           → onIdle 回调：标记 idle，断开 MCP，更新 DB
- 16.0s ─── Client 重连，session/resume → 重连 MCP，timer = AfterFunc(9s)，恢复 active
-```
-
-### 7.3 优雅释放与恢复
+### 7.2 断开自动 Idle + 恢复
 
 ```
 客户端 A                           Agent Server                      客户端 B
   │                                   │                                  │
+  │──session/new──► (active)          │                                  │
   │──prompt──► (推理进行中...)         │                                  │
   │                                   │                                  │
-  │──_release──────────────────────► │                                  │
-  │◄───────{ok}──────────────────────│                                  │
-  │  (客户端 A 断开连接)               │  (Session 标记为 idle)            │
+  │  (客户端 A 断开连接)               │                                  │
+  │                                   │──conn.Done() → MarkIdle         │
+  │                                   │  (断开 MCP，标记 idle)            │
   │                                   │                                  │
   │                                   │  ◄────session/list───────────────│
   │                                   │  ────[{session_id, ...}]────────►│
@@ -778,20 +704,20 @@ Client                    Agent Server                   DB              MCP Ser
   │                                   │  ────SessionUpdate(流式)─────────►│
 ```
 
-### 7.4 并发冲突
+### 7.3 并发冲突
 
 **跨连接冲突：** A 持有 active session，B 尝试操作。
 
 ```
 客户端 A                              Agent Server                       客户端 B
   │                                      │                                   │
-  │──resume──► (session X: idle→active)   │                                   │
+  │──session/resume──► (X: idle→active)   │                                   │
   │──prompt──► (推理中...)                │                                   │
   │                                      │    ◄────session/resume────────────│
-  │                                      │    ──{error: session not idle}───►│
+  │                                      │    ──{error: active in another}──►│
   │                                      │    ◄────session/prompt────────────│
-  │                                      │    ──{error: session not owned}──►│
-  │──_release──►                         │                                   │
+  │                                      │    ──{error: does not belong}────►│
+  │  (客户端 A 断开)                      │                                   │
   │                                      │    ◄────session/resume────────────│
   │                                      │    ──{ok}────────────────────────►│
 ```
@@ -808,7 +734,7 @@ Client                    Agent Server                   DB              MCP Ser
   │──prompt(session X)──► (可以了)        │
 ```
 
-- 跨连接：状态校验 + 归属校验双重拦截
+- 跨连接：active 状态的 session 拒绝其他连接的所有操作
 - 同连接并发：session 级别的 prompt 互斥锁，同一时刻只允许一个 prompt 执行
 
 ---
